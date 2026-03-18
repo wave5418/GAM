@@ -75,8 +75,13 @@ class TemporalResonanceGraphMemory:
                  vector_db: Optional[VectorDBInterface] = None,
                  encoder_model: str = 'all-MiniLM-L6-v2',
                  embedding_model: str = 'minilm',
+                 embedding_model_name: Optional[str] = None,
+                 embedding_api_key: Optional[str] = None,
+                 embedding_base_url: Optional[str] = None,
                  llm_backend: str = 'openai',
                  llm_model: str = 'gpt-4o-mini',
+                 llm_api_key: Optional[str] = None,
+                 llm_base_url: Optional[str] = None,
                  persist_dir: Optional[str] = None,
                  enable_async: bool = False):
         """
@@ -99,9 +104,17 @@ class TemporalResonanceGraphMemory:
 
         # Choose encoder based on embedding_model parameter
         if embedding_model == 'openai':
-            self.encoder = VectorEncoder(model_name='text-embedding-3-small', use_openai=True)
+            self.encoder = VectorEncoder(
+                model_name=embedding_model_name or 'text-embedding-3-small',
+                use_openai=True,
+                api_key=embedding_api_key,
+                base_url=embedding_base_url
+            )
         else:  # minilm
-            self.encoder = VectorEncoder(model_name=encoder_model, use_openai=False)
+            self.encoder = VectorEncoder(
+                model_name=embedding_model_name or encoder_model,
+                use_openai=False
+            )
         self.vector_db = vector_db or create_vector_db(
             backend="auto",
             dimension=self.encoder.dimension,
@@ -113,15 +126,17 @@ class TemporalResonanceGraphMemory:
         if LLM_AVAILABLE and llm_backend:
             try:
                 # Get API key from environment for OpenAI
-                api_key = None
+                api_key = llm_api_key
+                base_url = llm_base_url
                 if llm_backend == 'openai':
-                    import os
-                    api_key = os.getenv('OPENAI_API_KEY')
+                    api_key = api_key or os.getenv('OPENAI_API_KEY')
+                    base_url = base_url or os.getenv('OPENAI_BASE_URL')
 
                 self.llm_controller = LLMController(
                     backend=llm_backend,
                     model=llm_model,
-                    api_key=api_key
+                    api_key=api_key,
+                    base_url=base_url
                 )
             except Exception as e:
                 logging.warning(f"Failed to initialize LLM controller: {e}")

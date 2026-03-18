@@ -61,15 +61,21 @@ class BaseLLMController(ABC):
         pass
 
 class OpenAIController(BaseLLMController):
-    def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None):
+    def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None, base_url: Optional[str] = None):
         try:
             from openai import OpenAI
             self.model = model
             if api_key is None:
                 api_key = os.getenv('OPENAI_API_KEY')
+            if base_url is None:
+                base_url = os.getenv('OPENAI_BASE_URL')
             if api_key is None:
                 raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
-            self.client = OpenAI(api_key=api_key)
+            client_kwargs = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            self.client = OpenAI(**client_kwargs)
+            self.base_url = base_url
             # Track token usage across all API calls
             self.token_usage = {
                 'prompt_tokens': [],
@@ -170,9 +176,10 @@ class LLMController:
     def __init__(self, 
                  backend: Literal["openai", "ollama"] = "openai",
                  model: str = "gpt-4", 
-                 api_key: Optional[str] = None):
+                 api_key: Optional[str] = None,
+                 base_url: Optional[str] = None):
         if backend == "openai":
-            self.llm = OpenAIController(model, api_key)
+            self.llm = OpenAIController(model, api_key, base_url)
         elif backend == "ollama":
             self.llm = OllamaController(model)
         else:

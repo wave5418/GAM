@@ -533,7 +533,13 @@ class NumpyVectorDB(VectorDBInterface):
 class VectorEncoder:
     """Helper class for encoding text to vectors"""
 
-    def __init__(self, model_name: str = 'text-embedding-3-small', use_openai: bool = True):
+    def __init__(
+        self,
+        model_name: str = 'text-embedding-3-small',
+        use_openai: bool = True,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None
+    ):
         """Initialize the vector encoder
 
         Args:
@@ -546,7 +552,11 @@ class VectorEncoder:
             # Use OpenAI encoder
             try:
                 from .openai_encoder import OpenAIVectorEncoder
-                self.encoder = OpenAIVectorEncoder(model_name)
+                self.encoder = OpenAIVectorEncoder(
+                    model_name=model_name,
+                    api_key=api_key,
+                    base_url=base_url
+                )
                 self.dimension = self.encoder.dimension
                 logger.info(f"Using OpenAI embeddings ({model_name}, {self.dimension} dims)")
             except Exception as e:

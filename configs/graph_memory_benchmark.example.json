@@ -1,0 +1,14 @@
+{
+  "dataset": "data/locomo10.json",
+  "sample": [0],
+  "methods": "graph_full,basic_retrieval,no_causal,no_temporal,flat_graph,vector_only,keyword_only",
+  "max_questions": 20,
+  "categories": [1, 2, 3, 4],
+  "cache_dir": "./benchmark_cache",
+  "output_dir": "./benchmark_results",
+  "model_name": "gpt-4o-mini",
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "sk-xxx",
+  "embedding_backend": "minilm",
+  "embedding_model_name": "all-MiniLM-L6-v2"
+}

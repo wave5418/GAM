@@ -35,7 +35,12 @@ class MemoryBuilder:
         cache_dir: str,
         llm_model: str = "gpt-4o-mini",
         use_episodes: bool = False,
-        embedding_model: str = "minilm"
+        embedding_model: str = "minilm",
+        llm_api_key: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+        embedding_model_name: Optional[str] = None,
+        embedding_api_key: Optional[str] = None,
+        embedding_base_url: Optional[str] = None
     ):
         """
         Initialize memory builder.
@@ -55,22 +60,34 @@ class MemoryBuilder:
         self.llm_model = llm_model
         self.use_episodes = use_episodes
         self.embedding_model = embedding_model
+        self.embedding_model_name = embedding_model_name
+        self.llm_api_key = llm_api_key or os.getenv('OPENAI_API_KEY')
+        self.llm_base_url = llm_base_url or os.getenv('OPENAI_BASE_URL')
+        self.embedding_api_key = embedding_api_key or os.getenv('EMBEDDING_API_KEY') or self.llm_api_key
+        self.embedding_base_url = embedding_base_url or os.getenv('EMBEDDING_BASE_URL') or self.llm_base_url
 
         self.trg = TemporalResonanceGraphMemory(
             llm_backend='openai',
             llm_model=llm_model,
+            llm_api_key=self.llm_api_key,
+            llm_base_url=self.llm_base_url,
             enable_async=False,
             persist_dir=str(self.cache_dir),
-            embedding_model=embedding_model
+            embedding_model=embedding_model,
+            embedding_model_name=embedding_model_name,
+            embedding_api_key=self.embedding_api_key,
+            embedding_base_url=self.embedding_base_url
         )
 
-        api_key = os.getenv('OPENAI_API_KEY')
+        api_key = self.llm_api_key
+        base_url = self.llm_base_url
         self.llm_controller = None
         if api_key:
             self.llm_controller = LLMController(
                 backend='openai',
                 model=llm_model,
-                api_key=api_key
+                api_key=api_key,
+                base_url=base_url
             )
         else:
             logger.warning(
@@ -339,9 +356,17 @@ class MemoryBuilder:
         )
 
         if self.embedding_model == 'openai':
-            encoder = VectorEncoder(model_name='text-embedding-3-small', use_openai=True)
+            encoder = VectorEncoder(
+                model_name=self.embedding_model_name or 'text-embedding-3-small',
+                use_openai=True,
+                api_key=self.embedding_api_key,
+                base_url=self.embedding_base_url
+            )
         else:
-            encoder = VectorEncoder(model_name='all-MiniLM-L6-v2', use_openai=False)
+            encoder = VectorEncoder(
+                model_name=self.embedding_model_name or 'all-MiniLM-L6-v2',
+                use_openai=False
+            )
         embeddings = encoder.encode(f"{episode.title} {episode.content}")
         episode_node.embedding_vector = embeddings[0] if len(embeddings.shape) > 1 else embeddings
 
@@ -369,9 +394,17 @@ class MemoryBuilder:
         session_summaries = sample.session_summary
 
         if self.embedding_model == 'openai':
-            encoder = VectorEncoder(model_name='text-embedding-3-small', use_openai=True)
+            encoder = VectorEncoder(
+                model_name=self.embedding_model_name or 'text-embedding-3-small',
+                use_openai=True,
+                api_key=self.embedding_api_key,
+                base_url=self.embedding_base_url
+            )
         else:
-            encoder = VectorEncoder(model_name='all-MiniLM-L6-v2', use_openai=False)
+            encoder = VectorEncoder(
+                model_name=self.embedding_model_name or 'all-MiniLM-L6-v2',
+                use_openai=False
+            )
 
         for session_id in sorted(sample.conversation.sessions.keys()):
             session = sample.conversation.sessions[session_id]
