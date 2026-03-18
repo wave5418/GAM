@@ -1,227 +1,175 @@
-# MAGMA: A Multi-Graph based Agentic Memory Architecture
+# GAM: Graph Agent Memory Benchmark Framework
 
-**A principled, multi-graph memory system for long-horizon agentic reasoning.**
+`GAM` is a benchmark-oriented framework for testing graph-based agent memory systems on long-horizon dialogue tasks.
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2601.03236">
-    <img src="https://img.shields.io/badge/Arxiv-paper-red" alt="MAGMA"
-  </a>
-</p>
+This repository now combines two layers:
 
-<h5 align="center"> 🎉 If you are interested, please star ⭐ on GitHub for the latest update.</h5>
+- `gam/`: a more standalone experiment framework for configuration, method registration, execution, and reporting
+- `memory/`: the underlying graph-memory implementation used by the benchmark adapters
 
-##  🔥 Research Highlights
-- Read the full paper: <a href="https://arxiv.org/abs/2601.03236" target="_blank">https://arxiv.org/abs/2601.03236</a>
+The goal is to make experiments easier to run, compare, and evolve without tying the whole workflow to one large evaluation script.
 
+## What It Supports
 
-## 📖 Overview
+- User-defined LLM `base_url`, `api_key`, and `model_name`
+- User-defined embedding backend and embedding model
+- Side-by-side comparison across graph-memory variants and retrieval baselines
+- Structured JSON benchmark outputs
+- Compatibility entrypoint for older usage patterns
 
-**MAGMA** (Multi-Graph based Agentic Memory Architecture) is a sophisticated memory system designed for long-term conversation memory and multi-hop reasoning. It creates interconnected event nodes linked by temporal, semantic, and causal relationships, enabling intelligent question answering across extended dialogues.
+## Methods Available
 
+The benchmark layer currently supports the following methods:
 
+- `graph_full`
+- `basic_retrieval`
+- `no_causal`
+- `no_temporal`
+- `flat_graph`
+- `vector_only`
+- `keyword_only`
+- `scan_only`
 
-## 🛠️ Installation
+## Project Layout
 
-### Prerequisites
-
-- Python 3.9 or higher
-- Virtual environment (recommended)
-
-### Setup
-
-1. Clone the repository:
-```bash
-git clone https://github.com/FredJiang0324/MAMGA.git
-cd MAMGA
+```text
+MAMGA/
+├── gam/                           # Standalone benchmark package
+│   ├── cli.py                    # CLI entry
+│   ├── config.py                 # Experiment configuration
+│   ├── methods.py                # Method registry
+│   ├── baselines.py              # Retrieval-only baselines
+│   ├── workspace.py              # Run orchestration
+│   └── reporting.py              # Metrics/report helpers
+├── gam_cli.py                    # Preferred CLI entrypoint
+├── run_graph_memory_benchmark.py # Compatibility wrapper
+├── memory/                       # Graph memory implementation
+├── data/                         # Dataset files
+├── examples/                     # Sample inputs
+└── GRAPH_AGENT_MEMORY_FRAMEWORK.md
 ```
 
-2. Create and activate a virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
+## Installation
 
-3. Install dependencies:
+### Recommended
+
 ```bash
+git clone https://github.com/wave5418/GAM.git
+cd GAM
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-4. Set up environment variables:
+### Minimal smoke-test dependencies
+
+If you only want to verify the CLI and OpenAI-compatible integration first:
+
 ```bash
-cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
+pip install networkx openai python-dotenv faiss-cpu
 ```
+
+For full local MiniLM-based experiments, install the full `requirements.txt`.
 
 ## Quick Start
 
-### Testing with LoCoMo Dataset
+### 1. Run the new standalone CLI
 
 ```bash
-# Test on LoCoMo dataset (10 samples included)
-python test_fixed_memory.py --sample 0 --model gpt-4o-mini --max-questions 10 --category-to-test 1,2,3,4,5
-
-# Test specific question categories
-python test_fixed_memory.py --sample 0 --category-to-test 1  # Multi-hop only
-
-# Test multiple samples
-python test_fixed_memory.py --sample 0 1 2 --max-questions 50
-
-# Full dataset path: data/locomo10.json
+python gam_cli.py \
+  --dataset data/locomo10.json \
+  --sample 0 \
+  --methods graph_full,basic_retrieval,no_causal,no_temporal,flat_graph,vector_only,keyword_only \
+  --model-name gpt-4o-mini \
+  --embedding-backend minilm \
+  --max-questions 10 \
+  --parallel
 ```
 
-### Testing with LongMemEval Dataset
+### 2. Use an OpenAI-compatible endpoint
 
 ```bash
-# Test with the main evaluation script (40% accuracy on multi-session)
-python test_longmemeval_chunked.py --dataset data/longmemeval_s_cleaned.json --max-questions 5
+python gam_cli.py \
+  --dataset data/locomo10.json \
+  --sample 0 \
+  --methods graph_full,vector_only,keyword_only \
+  --model-name Qwen/Qwen2.5-72B-Instruct \
+  --base-url https://api.siliconflow.cn/v1 \
+  --api-key sk-your-key \
+  --embedding-backend openai \
+  --embedding-model-name text-embedding-3-small \
+  --embedding-base-url https://api.siliconflow.cn/v1 \
+  --embedding-api-key sk-your-key
+```
 
-# Test with sample data (included)
-python test_longmemeval_chunked.py --dataset examples/longmemeval_sample.json --max-questions 5
+### 3. Keep using the compatibility entrypoint
 
-# Note: Download longmemeval_s_cleaned.json separately (see Datasets section)
+```bash
+python run_graph_memory_benchmark.py --help
 ```
 
 ## Datasets
 
-This system is evaluated on two primary datasets:
+### LoCoMo
 
-### 1. LoCoMo (Long Conversation Memory) - `data/locomo10.json`
-- 10 conversation samples with extensive Q&A pairs
-- 5 question categories: Multi-hop, Temporal, Open-domain, Single-hop, Adversarial
-- Tests long-term memory and reasoning capabilities
-- **Status**: Included in repository (2.7MB)
+- Path: `data/locomo10.json`
+- Included in the repository
+- Best current fit for the standalone `gam/` benchmark flow
 
-### 2. LongMemEval - `data/longmemeval_s_cleaned.json`
-- Multi-session conversation dataset
-- Focus on counting and aggregation across sessions
-- Tests ability to track information across conversation boundaries
-- **Status**: Download from HuggingFace (see instructions below)
-- **Sample**: Small sample included in `examples/longmemeval_sample.json`
+### LongMemEval
 
-### Dataset Setup
+- Sample file included in `examples/longmemeval_sample.json`
+- Full dataset needs to be downloaded separately if you want to run the older LongMemEval scripts
 
-1. **LoCoMo dataset** is included and ready to use
+## Output
 
-2. **LongMemEval dataset** - Download from HuggingFace:
-```bash
-mkdir -p data/
-cd data/
-wget https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
-cd ..
+Benchmark results are written to:
+
+```text
+benchmark_results/graph_memory_benchmark_<model>.json
 ```
+
+Each report includes:
+
+- experiment config
+- selected samples
+- memory statistics
+- per-method results
+- aggregate metrics
+- category breakdown
 
 ## Configuration
 
-### Embedding Models
+You can pass settings directly by CLI flags or use a JSON config file.
 
-- **MiniLM** (default): Fast, offline, 384-dimensional embeddings
-- **OpenAI**: Higher quality, requires API key, 1536-dimensional embeddings
+Example:
 
 ```bash
-# Use MiniLM (default)
-python test_fixed_memory.py --embedding-model minilm
-
-# Use OpenAI embeddings
-python test_fixed_memory.py --embedding-model openai
+python gam_cli.py --config configs/graph_memory_benchmark.example.json
 ```
 
-### LLM Models
+Configurable fields include:
 
-Supports OpenAI models:
-- `gpt-4o-mini` (Default)
-- `gpt-4.1-mini` 
-- `gpt-4o` 
-- `gpt-3.5-turbo` 
+- dataset path
+- sample ids
+- compared methods
+- model endpoint settings
+- embedding settings
+- cache and output directories
+- parallel workers
+- best-of-n strategy
 
-### Cache Management
+## Current Design Notes
 
-Memory is cached for efficiency:
-```bash
-# Default cache location
-./locomo_trg_cache/sample{N}/
+- The `gam/` package is intentionally more independent from the original script layout.
+- The benchmark layer is now framework-owned, with clearer separation between config, method selection, orchestration, and reporting.
+- The underlying `memory/` implementation is still reused through adapters rather than being fully rewritten from scratch.
 
-# Custom cache directory
-python test_fixed_memory.py --cache-dir ./my_cache
+## Related Docs
 
-# Force rebuild
-python test_fixed_memory.py --rebuild
-```
-
-## Advanced Usage
-
-### Query Engine Parameters
-
-Configure retrieval behavior in `memory/query_engine.py`:
-
-```python
-# Retrieval parameters
-vector_search_k = 20        # Initial vector search results
-keyword_threshold = 0.3     # Minimum keyword score
-top_k_final = 5            # Final context nodes
-max_traversal_hops = 3     # Graph traversal depth
-```
-
-
-## File Structure
-
-```
-trg-memory/
-├── memory/                  # Core memory modules
-│   ├── trg_memory.py       # Main memory engine
-│   ├── graph_db.py         # Graph database
-│   ├── vector_db.py        # Vector database
-│   ├── query_engine.py     # Query processing
-│   ├── memory_builder.py   # Memory construction
-│   └── ...
-├── utils/                   # Utility modules
-│   ├── memory_layer.py     # LLM controller
-│   └── load_dataset.py     # Dataset loader
-├── test_fixed_memory.py              # LoCoMo test script
-├── test_longmemeval_chunked.py       # LongMemEval test script
-├── load_longmemeval.py     # LongMemEval loader
-├── examples/               # Sample datasets
-├── data/                   # Full datasets (not included)
-└── requirements.txt        # Dependencies
-```
-
-## Evaluation Metrics
-
-The system uses multiple evaluation metrics:
-
-- **Exact Match**: Binary correctness
-- **F1 Score**: Token-level overlap (0-100%)
-- **BLEU Score**: N-gram similarity (0-100%)
-- **LLM Judge**: GPT-based semantic evaluation (0-100%)
+- `GRAPH_AGENT_MEMORY_FRAMEWORK.md`: practical benchmark usage notes
+- `MAMGA_API_CONFIG.md`: API and endpoint configuration notes
 
 ## License
 
-MIT License - see LICENSE file for details.
-
-## Note
-
-Have ideas or suggestions? Please feel free to submit issues or pull requests! 🚀
-
-<span id='doc'/>
-
-## 📖 Documentation
-
-A more detailed documentation is coming soon 🚀, and we will update in the Github page.
-
-<span id='cite'/>
-
-## 📣 Citation
-**If you find this project useful, please consider citing our paper:**
-
-```bibtex
-@misc{jiang2026magmamultigraphbasedagentic,
-      title={MAGMA: A Multi-Graph based Agentic Memory Architecture for AI Agents}, 
-      author={Dongming Jiang and Yi Li and Guanpeng Li and Bingzhe Li},
-      year={2026},
-      eprint={2601.03236},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2601.03236}, 
-}
-```
-
-
+MIT License. See `LICENSE`.
