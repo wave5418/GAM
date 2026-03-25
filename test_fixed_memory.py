@@ -369,6 +369,8 @@ def main():
     parser.add_argument("--ablation", type=str, default=None,
                        choices=["basic_retrieval", "no_causal", "no_temporal", "flat_graph"],
                        help="Run ablation study with specific configuration")
+    parser.add_argument("--debug-search", action="store_true",
+                       help="Enable full retrieval trace logging for every question and write a separate debug JSON")
     args = parser.parse_args()
 
     # Parallel is enabled by default
@@ -392,7 +394,7 @@ def main():
 
     print(f"  Categories to test: {sorted(categories_to_test)}")
     category_names = {1: "Multi-hop", 2: "Temporal", 3: "Open-domain", 4: "Single-hop", 5: "Adversarial"}
-    print(f"  Category types: {', '.join([f'{c}:{category_names.get(c, 'Unknown')}' for c in sorted(categories_to_test)])}")
+    print("  Category types: " + ', '.join([f"{c}:{category_names.get(c, 'Unknown')}" for c in sorted(categories_to_test)]))
 
     # Show parallel mode status
     # if args.parallel:
@@ -496,6 +498,7 @@ def main():
 
         # Initialize test harness with evaluator
         tester = TestHarness(builder, query_engine, evaluator=evaluator)
+        tester.debug_search = args.debug_search
 
         # Setup best-of-N if requested
         if args.best_of_n > 1:
@@ -651,6 +654,33 @@ def main():
             }, f, indent=2, default=str)
 
         print(f"Results saved to {output_file}")
+
+        if args.debug_search:
+            debug_output_file = f"{results_dir}/fixed_results_sample{sample_id}{embedding_suffix}_debug.json"
+            debug_payload = {
+                'sample_id': sample_id,
+                'timestamp': datetime.now().isoformat(),
+                'embedding_model': args.embedding_model,
+                'llm_model': args.model,
+                'debug_search': True,
+                'results': [
+                    {
+                        'question_id': r.get('question_id'),
+                        'question': r.get('question'),
+                        'category': r.get('category'),
+                        'expected': r.get('expected'),
+                        'predicted': r.get('predicted'),
+                        'llm_judge_score': r.get('llm_judge_score'),
+                        'processing_time': r.get('processing_time'),
+                        'search_details': r.get('search_details', {}),
+                        'answer_context': r.get('answer_context')
+                    }
+                    for r in results
+                ]
+            }
+            with open(debug_output_file, 'w') as f:
+                json.dump(debug_payload, f, indent=2, default=str)
+            print(f"Debug search trace saved to {debug_output_file}")
 
         # Store for aggregation
         all_sample_results.append({

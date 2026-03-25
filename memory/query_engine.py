@@ -52,6 +52,35 @@ class QueryEngine:
         self.llm_controller = llm_controller
         self.ablation_config = ablation_config or {}
 
+    def _node_debug_entry(self, node, rank: int = None) -> dict:
+        entry = {
+            'node_id': getattr(node, 'node_id', None),
+            'node_type': str(getattr(node, 'node_type', 'EVENT')),
+            'score': getattr(node, 'ranking_score', getattr(node, 'similarity_score', 0.0)),
+        }
+
+        content = None
+        if hasattr(node, 'content_narrative'):
+            content = node.content_narrative
+        elif hasattr(node, 'summary'):
+            content = node.summary
+
+        if content:
+            entry['content'] = content[:200]
+
+        if rank is not None:
+            entry['rank'] = rank
+
+        attributes = getattr(node, 'attributes', None) or {}
+        dia_id = attributes.get('dia_id')
+        session_id = attributes.get('session_id')
+        if dia_id:
+            entry['dia_id'] = dia_id
+        if session_id is not None:
+            entry['session_id'] = session_id
+
+        return entry
+
     def _rrf_fusion(self, ranked_lists: List[List], k: int = 60) -> List[Tuple]:
         """
         Fuse multiple ranked lists using Reciprocal Rank Fusion (RRF).
@@ -864,7 +893,14 @@ class QueryEngine:
             'scan_search_count': added if 'added' in locals() else 0,
             'top_k_requested': top_k,
             'top_k_returned': len(top_nodes),
-            'adaptive_params': adaptive_params
+            'adaptive_params': adaptive_params,
+            'retrieval_stages': {
+                'vector': [self._node_debug_entry(node, idx + 1) for idx, node in enumerate(vector_nodes[:20])] if 'vector_nodes' in locals() else [],
+                'keyword': [self._node_debug_entry(node, idx + 1) for idx, node in enumerate(keyword_nodes[:20])] if 'keyword_nodes' in locals() else [],
+                'scan': [self._node_debug_entry(node, idx + 1) for idx, node in enumerate(scan_nodes[:20])] if 'scan_nodes' in locals() else [],
+                'fused': [self._node_debug_entry(node, idx + 1) for idx, node in enumerate(all_candidates[:20])],
+                'final': [self._node_debug_entry(node, idx + 1) for idx, node in enumerate(top_nodes[:20])],
+            }
         }
 
         answer_context = self.answer_formatter.format_context_for_qa(

@@ -45,6 +45,52 @@ class TestHarness:
 
         self.answer_formatter = memory_builder.answer_formatter
 
+    def _extract_node_summaries(self, query_context, limit: int = 10) -> List[Dict]:
+        node_summaries = []
+        if not query_context or not getattr(query_context, 'anchor_nodes', None):
+            return node_summaries
+
+        for idx, node in enumerate(query_context.anchor_nodes[:limit]):
+            node_summary = {
+                'rank': idx + 1,
+                'node_id': getattr(node, 'node_id', None),
+                'node_type': str(getattr(node, 'node_type', 'EVENT')),
+                'score': getattr(node, 'ranking_score', getattr(node, 'similarity_score', 0.0))
+            }
+
+            if hasattr(node, 'content_narrative'):
+                node_summary['content'] = node.content_narrative[:200]
+            elif hasattr(node, 'summary'):
+                node_summary['content'] = node.summary[:200]
+            else:
+                node_summary['content'] = 'No content available'
+
+            attrs = getattr(node, 'attributes', None) or {}
+            if attrs.get('dia_id'):
+                node_summary['dia_id'] = attrs.get('dia_id')
+            if attrs.get('session_id') is not None:
+                node_summary['session_id'] = attrs.get('session_id')
+
+            node_summaries.append(node_summary)
+
+        return node_summaries
+
+    def _build_search_payload(self, query_context, answer_context: str, llm_score: float) -> tuple:
+        debug_mode = bool(getattr(self, 'debug_search', False))
+
+        if query_context and hasattr(query_context, 'metadata'):
+            search_details = query_context.metadata.copy()
+        else:
+            search_details = {}
+
+        if not debug_mode and llm_score >= 0.5:
+            query_type = search_details.get('query_type', 'unknown')
+            return {'query_type': query_type}, None
+
+        search_details.pop('adaptive_params', None)
+        search_details['top_nodes'] = self._extract_node_summaries(query_context, limit=15)
+        return search_details, answer_context
+
     def answer_question(self, question: str, context: str, category: int = None, expected: str = None) -> str:
         """
         Generate answer from context using QA LLM.
@@ -335,53 +381,11 @@ class TestHarness:
                 total_llm_score += llm_score
                 llm_scores_count += 1
 
-            if llm_score < 0.5:
-                search_details = {}
-                if query_context:
-                    if hasattr(query_context, 'metadata'):
-                        search_details = query_context.metadata.copy()
-                        search_details.pop('adaptive_params', None)
-
-                    if query_context.anchor_nodes:
-                        node_summaries = []
-                        for idx, node in enumerate(query_context.anchor_nodes[:10]):
-                            node_summary = {
-                                'rank': idx + 1,
-                                'node_id': node.node_id,
-                                'node_type': str(node.node_type) if hasattr(node, 'node_type') else 'EVENT',
-                                'score': getattr(node, 'ranking_score', 0.0)
-                            }
-
-                            if hasattr(node, 'content_narrative'):
-                                node_summary['content'] = node.content_narrative[:80] + '...'
-                            elif hasattr(node, 'summary'):
-                                node_summary['content'] = node.summary[:80] + '...'
-                            else:
-                                node_summary['content'] = 'No content available'
-
-                            if hasattr(node, 'attributes') and node.attributes:
-                                dia_id = node.attributes.get('dia_id')
-                                if dia_id:
-                                    node_summary['dia_id'] = dia_id
-                                elif hasattr(node, 'node_type') and 'SESSION' in str(node.node_type):
-                                    node_summary['dia_id'] = f"SESSION_{node.attributes.get('session_id', 'unknown')}"
-                                else:
-                                    node_summary['dia_id'] = 'MISSING'
-
-                                if 'session_id' in node.attributes:
-                                    node_summary['session_id'] = node.attributes['session_id']
-                            else:
-                                node_summary['dia_id'] = 'NO_ATTRIBUTES'
-
-                            node_summaries.append(node_summary)
-                        search_details['top_nodes'] = node_summaries
-
-                full_answer_context = answer_context
-            else:
-                search_details = {
-                    'query_type': query_context.metadata.get('query_type', 'unknown') if query_context and hasattr(query_context, 'metadata') else 'unknown'
-                }
-                full_answer_context = None
+            search_details, full_answer_context = self._build_search_payload(
+                query_context,
+                answer_context,
+                llm_score
+            )
 
             result = {
                 'question_id': qa_idx,
@@ -397,7 +401,7 @@ class TestHarness:
                 'search_details': search_details
             }
 
-            if llm_score < 0.5:
+            if full_answer_context is not None:
                 result['answer_context'] = full_answer_context
 
             results.append(result)
@@ -486,49 +490,12 @@ class TestHarness:
                         total_llm_score[0] += llm_score
                         llm_scores_count[0] += 1
 
-                # Build search details for wrong answers
-                search_details = {}
-                full_answer_context = None
-
-                if llm_score < 0.5:
-                    # Extract detailed search information for wrong answers
-                    if query_context:
-                        # Get metadata if available
-                        if hasattr(query_context, 'metadata'):
-                            search_details = query_context.metadata.copy()
-                            # Remove adaptive_params from details (too verbose)
-                            search_details.pop('adaptive_params', None)
-
-                        # Add node summaries for the top nodes used
-                        if query_context.anchor_nodes:
-                            node_summaries = []
-                            for idx, node in enumerate(query_context.anchor_nodes[:10]):
-                                node_summary = {
-                                    'rank': idx + 1,
-                                    'node_id': node.node_id,
-                                    'node_type': str(node.node_type) if hasattr(node, 'node_type') else 'EVENT',
-                                    'score': getattr(node, 'ranking_score', 0.0)
-                                }
-
-                                # Add snippet of content
-                                if hasattr(node, 'content_narrative'):
-                                    node_summary['content'] = node.content_narrative[:80] + '...'
-                                elif hasattr(node, 'summary'):
-                                    node_summary['content'] = node.summary[:80] + '...'
-                                else:
-                                    node_summary['content'] = 'No content available'
-
-                                # Add dia_id if available
-                                if hasattr(node, 'attributes') and node.attributes:
-                                    dia_id = node.attributes.get('dia_id')
-                                    if dia_id:
-                                        node_summary['dia_id'] = dia_id
-
-                                node_summaries.append(node_summary)
-
-                            search_details['top_nodes'] = node_summaries
-
-                    full_answer_context = answer_context
+                # Build search details and optional full context
+                search_details, full_answer_context = self._build_search_payload(
+                    query_context,
+                    answer_context,
+                    llm_score
+                )
 
                 # Build result
                 result = {
@@ -545,8 +512,7 @@ class TestHarness:
                     'search_details': search_details
                 }
 
-                # Only add answer_context for wrong answers
-                if llm_score < 0.5:
+                if full_answer_context is not None:
                     result['answer_context'] = full_answer_context
 
                 return result, is_correct, metrics, llm_score
