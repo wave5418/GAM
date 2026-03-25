@@ -1,0 +1,104 @@
+{
+  "sessions": [
+    {
+      "session_id": "session_1",
+      "title": "Shopping Trip",
+      "messages": [
+        {
+          "role": "user",
+          "content": "I went shopping today and bought 3 shirts from the mall."
+        },
+        {
+          "role": "assistant",
+          "content": "That sounds like a productive shopping trip! Did you find some good deals on the shirts?"
+        },
+        {
+          "role": "user",
+          "content": "Yes, they were on sale. I also picked up 2 pairs of jeans."
+        },
+        {
+          "role": "assistant",
+          "content": "Great! New shirts and jeans make for a nice wardrobe refresh."
+        }
+      ]
+    },
+    {
+      "session_id": "session_2",
+      "title": "Weekend Activities",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Over the weekend, I bought a new jacket and a hat for the winter."
+        },
+        {
+          "role": "assistant",
+          "content": "Good thinking to prepare for winter! A warm jacket and hat are essential."
+        },
+        {
+          "role": "user",
+          "content": "I also got 1 scarf. Now I'm all set for the cold weather."
+        },
+        {
+          "role": "assistant",
+          "content": "Perfect! You'll be well-prepared for the winter months ahead."
+        }
+      ]
+    },
+    {
+      "session_id": "session_3",
+      "title": "Project Update",
+      "messages": [
+        {
+          "role": "user",
+          "content": "I'm leading 2 projects at work this quarter."
+        },
+        {
+          "role": "assistant",
+          "content": "That's quite a responsibility! What kinds of projects are they?"
+        },
+        {
+          "role": "user",
+          "content": "One is a web application redesign and the other is a new mobile app."
+        },
+        {
+          "role": "assistant",
+          "content": "Both sound exciting and challenging. Managing two different platforms must keep you busy!"
+        }
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "question_id": "q1",
+      "question": "How many clothing items did the user buy in total?",
+      "answer": 9,
+      "question_type": "multi_session_count",
+      "session_ids": ["session_1", "session_2"],
+      "category": "counting"
+    },
+    {
+      "question_id": "q2",
+      "question": "How many projects is the user leading?",
+      "answer": 2,
+      "question_type": "single_session",
+      "session_ids": ["session_3"],
+      "category": "factual"
+    },
+    {
+      "question_id": "q3",
+      "question": "What did the user buy for winter?",
+      "answer": "jacket, hat, and scarf",
+      "question_type": "single_session",
+      "session_ids": ["session_2"],
+      "category": "listing"
+    },
+    {
+      "question_id": "q4",
+      "question": "How many shirts did the user purchase?",
+      "answer": 3,
+      "question_type": "single_session",
+      "session_ids": ["session_1"],
+      "category": "counting"
+    }
+  ]
+}
