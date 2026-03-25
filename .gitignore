@@ -11,6 +11,8 @@ __pycache__/
 nohup.out
 
 benchmark_results/
+benchmark_results*/
+benchmark_cache*/
 locomo_trg_cache*/
 locomo_trg_episodes*/
 

@@ -1,0 +1,37 @@
+[
+  {
+    "episode_id": "alf-0",
+    "goal": "Put the apple in the fridge.",
+    "summary": "The agent navigates to the kitchen, picks up an apple, opens the fridge, and places the apple inside.",
+    "trajectory": [
+      {
+        "observation": "You are in the kitchen. You see a counter with an apple and a closed fridge.",
+        "action": "look around"
+      },
+      {
+        "observation": "The apple is on the counter.",
+        "action": "take apple"
+      },
+      {
+        "observation": "You are holding the apple.",
+        "action": "open fridge"
+      },
+      {
+        "observation": "The fridge is open.",
+        "action": "put apple in fridge"
+      }
+    ],
+    "qa": [
+      {
+        "question": "What is the task goal in this ALFWorld episode?",
+        "answer": "Put the apple in the fridge.",
+        "category": 4
+      },
+      {
+        "question": "What object is placed in the fridge?",
+        "answer": "apple",
+        "category": 4
+      }
+    ]
+  }
+]

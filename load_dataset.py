@@ -56,6 +56,147 @@ class LoCoMoSample:
     observation: Observation
     session_summary: Dict[str, str]
 
+
+def _safe_str(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _to_trajectory_steps(sample: dict) -> List[dict]:
+    """
+    Extract a trajectory list from common ALFWorld-style schemas.
+    """
+    if isinstance(sample.get("trajectory"), list):
+        return sample["trajectory"]
+    if isinstance(sample.get("steps"), list):
+        return sample["steps"]
+    if isinstance(sample.get("history"), list):
+        return sample["history"]
+    return []
+
+
+def _build_turns_from_alfworld(sample: dict, sample_idx: int) -> List[Turn]:
+    turns: List[Turn] = []
+    trajectory = _to_trajectory_steps(sample)
+    turn_idx = 1
+
+    for step in trajectory:
+        if not isinstance(step, dict):
+            continue
+
+        observation = (
+            step.get("observation")
+            or step.get("obs")
+            or step.get("state")
+            or step.get("description")
+        )
+        action = step.get("action") or step.get("command")
+
+        if observation:
+            turns.append(
+                Turn(
+                    speaker="Environment",
+                    dia_id=f"{sample_idx}:{turn_idx}",
+                    text=_safe_str(observation),
+                )
+            )
+            turn_idx += 1
+
+        if action:
+            turns.append(
+                Turn(
+                    speaker="Agent",
+                    dia_id=f"{sample_idx}:{turn_idx}",
+                    text=_safe_str(action),
+                )
+            )
+            turn_idx += 1
+
+    # Fallback: some dumps only contain a plain text transcript
+    if not turns:
+        transcript = sample.get("transcript") or sample.get("text")
+        if transcript:
+            turns.append(
+                Turn(
+                    speaker="Environment",
+                    dia_id=f"{sample_idx}:1",
+                    text=_safe_str(transcript),
+                )
+            )
+
+    return turns
+
+
+def _build_qa_from_alfworld(sample: dict) -> List[QA]:
+    qa_items: List[QA] = []
+
+    # If dataset already has QA list, reuse it directly.
+    raw_qas = sample.get("qa") or sample.get("qas") or []
+    if isinstance(raw_qas, list):
+        for qa in raw_qas:
+            if not isinstance(qa, dict):
+                continue
+            question = qa.get("question") or qa.get("q")
+            answer = qa.get("answer") or qa.get("a") or qa.get("gold_answer")
+            if question and answer is not None:
+                qa_items.append(
+                    QA(
+                        question=_safe_str(question),
+                        answer=_safe_str(answer),
+                        evidence=[],
+                        category=int(qa.get("category", 4)) if str(qa.get("category", "4")).isdigit() else 4,
+                    )
+                )
+
+    if qa_items:
+        return qa_items
+
+    # Otherwise generate a minimal factual QA from typical ALFWorld fields.
+    task_goal = (
+        sample.get("goal")
+        or sample.get("task")
+        or sample.get("task_description")
+        or sample.get("instruction")
+        or sample.get("mission")
+    )
+
+    if task_goal:
+        qa_items.append(
+            QA(
+                question="What is the task goal in this ALFWorld episode?",
+                answer=_safe_str(task_goal),
+                evidence=[],
+                category=4,
+            )
+        )
+
+    final_answer = sample.get("final_answer") or sample.get("answer")
+    if final_answer:
+        qa_items.append(
+            QA(
+                question="What is the final outcome of this ALFWorld episode?",
+                answer=_safe_str(final_answer),
+                evidence=[],
+                category=4,
+            )
+        )
+
+    # Ensure at least one QA exists so evaluation can run.
+    if not qa_items:
+        qa_items.append(
+            QA(
+                question="What happened in this ALFWorld episode?",
+                answer="No explicit answer provided in source data.",
+                evidence=[],
+                category=4,
+            )
+        )
+
+    return qa_items
+
 def parse_session(session_data: List[dict], session_id: int, date_time: str) -> Session:
     """Parse a single session's data, including turns with images by using their captions."""
     turns = []
@@ -199,6 +340,89 @@ def load_locomo_dataset(file_path: Union[str, Path]) -> List[LoCoMoSample]:
     print(f"Min QAs in a sample: {min(qa_counts_per_sample)}")
     print(f"Max QAs in a sample: {max(qa_counts_per_sample)}")
     
+    return samples
+
+
+def load_alfworld_dataset(file_path: Union[str, Path]) -> List[LoCoMoSample]:
+    """
+    Load ALFWorld-style trajectories and adapt them into the internal sample schema.
+
+    Supported top-level layouts:
+    - JSON list of episodes
+    - JSON object with `episodes` list
+    - JSON Lines (one episode per line)
+    """
+    if isinstance(file_path, str):
+        file_path = Path(file_path)
+
+    if not file_path.exists():
+        raise FileNotFoundError(f"Dataset file not found at {file_path}")
+
+    content = file_path.read_text(encoding='utf-8').strip()
+    episodes: List[dict] = []
+
+    if not content:
+        return []
+
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, list):
+            episodes = parsed
+        elif isinstance(parsed, dict):
+            episodes = parsed.get("episodes", [])
+        else:
+            episodes = []
+    except json.JSONDecodeError:
+        # JSONL fallback
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            episodes.append(json.loads(line))
+
+    samples: List[LoCoMoSample] = []
+    for idx, episode in enumerate(episodes):
+        if not isinstance(episode, dict):
+            continue
+
+        turns = _build_turns_from_alfworld(episode, idx)
+        qa_list = _build_qa_from_alfworld(episode)
+
+        session = Session(
+            session_id=1,
+            date_time=_safe_str(
+                episode.get("date_time")
+                or episode.get("timestamp")
+                or "2024-01-01 00:00:00"
+            ),
+            turns=turns,
+        )
+
+        conversation = Conversation(
+            speaker_a="Agent",
+            speaker_b="Environment",
+            sessions={1: session},
+        )
+
+        session_summary_text = (
+            _safe_str(episode.get("summary"))
+            or _safe_str(episode.get("goal"))
+            or _safe_str(episode.get("task"))
+            or "ALFWorld episode summary unavailable."
+        )
+
+        samples.append(
+            LoCoMoSample(
+                sample_id=_safe_str(episode.get("sample_id") or episode.get("episode_id") or idx),
+                qa=qa_list,
+                conversation=conversation,
+                event_summary=EventSummary(events={}),
+                observation=Observation(observations={}),
+                session_summary={"session_1_summary": session_summary_text},
+            )
+        )
+
+    print(f"Loaded ALFWorld-style episodes: {len(samples)}")
     return samples
 
 def get_dataset_statistics(samples: List[LoCoMoSample]) -> Dict:

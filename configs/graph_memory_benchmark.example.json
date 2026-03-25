@@ -1,4 +1,5 @@
 {
+  "dataset_format": "locomo",
   "dataset": "data/locomo10.json",
   "sample": [0],
   "methods": "graph_full,basic_retrieval,no_causal,no_temporal,flat_graph,vector_only,keyword_only",

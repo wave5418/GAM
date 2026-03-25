@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from load_dataset import load_locomo_dataset
+from load_dataset import load_alfworld_dataset, load_locomo_dataset
 from memory.best_of_n_selector import BestOfNSelector
 from memory.evaluator import Evaluator
 from memory.memory_builder import MemoryBuilder
@@ -29,6 +29,8 @@ class BenchmarkWorkspace:
             os.environ["OPENAI_BASE_URL"] = self.config.llm.base_url
 
     def load_samples(self):
+        if self.config.dataset_format == "alfworld":
+            return load_alfworld_dataset(self.config.dataset)
         return load_locomo_dataset(self.config.dataset)
 
     def create_builder(self, sample_id: int) -> MemoryBuilder:

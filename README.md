@@ -33,7 +33,7 @@ The benchmark layer currently supports the following methods:
 ## Project Layout
 
 ```text
-MAMGA/
+GAM/
 ├── gam/                           # Standalone benchmark package
 │   ├── cli.py                    # CLI entry
 │   ├── config.py                 # Experiment configuration
@@ -42,7 +42,6 @@ MAMGA/
 │   ├── workspace.py              # Run orchestration
 │   └── reporting.py              # Metrics/report helpers
 ├── gam_cli.py                    # Preferred CLI entrypoint
-├── run_graph_memory_benchmark.py # Compatibility wrapper
 ├── memory/                       # Graph memory implementation
 ├── data/                         # Dataset files
 ├── examples/                     # Sample inputs
@@ -102,10 +101,30 @@ python gam_cli.py \
   --embedding-api-key sk-your-key
 ```
 
-### 3. Keep using the compatibility entrypoint
+### 3. Run ALFWorld-format data
 
 ```bash
-python run_graph_memory_benchmark.py --help
+python gam_cli.py \
+  --dataset-format alfworld \
+  --dataset examples/alfworld_sample.json \
+  --sample 0 \
+  --methods graph_full,vector_only,keyword_only,scan_only \
+  --max-questions 1 \
+  --categories 4
+```
+
+ALFWorld adapter currently accepts:
+
+- JSON list of episodes
+- JSON object with `episodes`
+- JSONL (one episode per line)
+
+Each episode is converted into one internal sample (single session with Agent/Environment turns).
+
+### 4. Show all CLI options
+
+```bash
+python gam_cli.py --help
 ```
 
 ## Datasets
@@ -120,6 +139,12 @@ python run_graph_memory_benchmark.py --help
 
 - Sample file included in `examples/longmemeval_sample.json`
 - Full dataset needs to be downloaded separately if you want to run the older LongMemEval scripts
+
+### ALFWorld
+
+- Use `--dataset-format alfworld` to switch parser mode
+- Works with common trajectory fields like `trajectory` / `steps` / `history`
+- If no QA is provided in source data, the loader auto-generates a minimal factual QA so evaluation can run
 
 ## Output
 

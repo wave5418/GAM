@@ -17,6 +17,7 @@ from .workspace import BenchmarkWorkspace
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Original benchmark CLI for Graph Agent Memory")
     parser.add_argument("--config", help="Optional JSON config file")
+    parser.add_argument("--dataset-format", choices=["locomo", "alfworld"], default=None)
     parser.add_argument("--dataset", default=None)
     parser.add_argument("--sample", type=int, nargs="+", default=None)
     parser.add_argument("--methods", default=None)

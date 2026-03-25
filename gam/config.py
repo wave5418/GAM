@@ -24,6 +24,7 @@ class EmbeddingSettings:
 
 @dataclass
 class BenchmarkConfig:
+    dataset_format: str
     dataset: str
     sample: List[int]
     methods: List[str]
@@ -73,6 +74,7 @@ class BenchmarkConfig:
             methods = [item.strip() for item in methods.split(",") if item.strip()]
 
         return cls(
+            dataset_format=read("dataset_format", "locomo"),
             dataset=read("dataset", "data/locomo10.json"),
             sample=read("sample", [0]),
             methods=methods,
