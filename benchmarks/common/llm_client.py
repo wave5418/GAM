@@ -69,14 +69,14 @@ class LLMClient:
             self._init_openai(api_key, base_url, timeout, **kwargs)
 
     def _openai_chat_token_limit_kwargs(self, max_tokens: int) -> dict[str, Any]:
-        """Use the correct token limit parameter for newer OpenAI models."""
+        """Chat Completions: gpt-5 / o-series reject ``max_tokens``; use ``max_completion_tokens``."""
         m = self.model.lower()
         if m.startswith(("gpt-5", "o1", "o3", "o4")):
             return {"max_completion_tokens": max_tokens}
         return {"max_tokens": max_tokens}
 
     def _openai_chat_temperature_kwargs(self, temperature: float) -> dict[str, Any]:
-        """gpt-5 / o-series only accept the default temperature; omit the field."""
+        """gpt-5 / o-series only accept the default temperature (1); omit the param for those models."""
         m = self.model.lower()
         if m.startswith(("gpt-5", "o1", "o3", "o4")):
             return {}
@@ -103,7 +103,6 @@ class LLMClient:
             return token_matches[-1] == "yes"
 
         return text.lower().startswith("yes")
-
     def _init_openai(self, api_key: str | None, base_url: str | None, timeout: float, **kwargs: Any) -> None:
         import openai
         client_kwargs: dict[str, Any] = {
