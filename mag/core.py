@@ -2646,6 +2646,7 @@ class MAGMemory(MemoryBase):
             "validator_candidates": 0,
             "validator_pool_added": 0,
             "vector_fallback_added": 0,
+            "context_support_attached": 0,
         }
 
         try:
@@ -2924,9 +2925,10 @@ class MAGMemory(MemoryBase):
 
         merged_list.sort(key=lambda x: x["score"], reverse=True)
 
-        # ── 上下文窗口: prev/next句作为额外candidate加入候选池 ──
+        # ── 上下文窗口: prev/next 作为父候选的 supporting text。
+        # Do not add neighbor sentences as independent high-score candidates;
+        # they are evidence support unless they already passed graph/vector routes.
         if self.mag_use_context_window and merged_list:
-            ctx_candidates = []
             seen_ids = {r.get("id", "") for r in merged_list}
             for r in merged_list:
                 pid = r.get("id", "")
@@ -2953,30 +2955,33 @@ class MAGMemory(MemoryBase):
                             continue
                         if neighbor_id in seen_ids:
                             continue
-                        # 邻居不在池中 → 作为新候选加入
                         try:
                             nb_p = self._mag_get_scoped_payload(neighbor_id, filters)
                             if nb_p is not None:
-                                ctx_candidates.append({
-                                    "id": neighbor_id,
-                                    "memory": nb_p.get("data", ""),
-                                    "score": base_score,
-                                    "created_at": nb_p.get("created_at", ""),
-                                    "source": "context_window",
-                                    "entities": nb_p.get("entities", []),
-                                    "route_scores": {
-                                        "context_parent": r.get("id", ""),
-                                        "context_score": round(base_score, 4),
-                                    },
-                                })
+                                support = r.setdefault("supporting_context", [])
+                                support_text = nb_p.get("data", "")
+                                support_ts = nb_p.get("created_at", "")
+                                if support_text:
+                                    support.append({
+                                        "id": neighbor_id,
+                                        "direction": direction.replace("_sentence_id", ""),
+                                        "memory": support_text,
+                                        "created_at": support_ts,
+                                    })
+                                    label = "previous" if direction == "prev_sentence_id" else "next"
+                                    ts_prefix = f"[{support_ts[:10]}] " if support_ts else ""
+                                    r["memory"] = (
+                                        f"{r.get('memory', '')}\n"
+                                        f"[supporting {label}: {ts_prefix}{support_text}]"
+                                    )
+                                    r.setdefault("route_scores", {})["context_support_count"] = len(support)
+                                    route_debug["context_support_attached"] += 1
                                 seen_ids.add(neighbor_id)
                         except Exception:
                             pass
                 except Exception:
                     pass
-            if ctx_candidates:
-                merged_list.extend(ctx_candidates)
-                merged_list.sort(key=lambda x: x["score"], reverse=True)
+            merged_list.sort(key=lambda x: x["score"], reverse=True)
 
         final = merged_list[:limit]
 
