@@ -2644,6 +2644,7 @@ class MAGMemory(MemoryBase):
             "graph_paths": 0,
             "graph_candidates": 0,
             "validator_candidates": 0,
+            "validator_pool_added": 0,
             "vector_fallback_added": 0,
         }
 
@@ -2802,7 +2803,9 @@ class MAGMemory(MemoryBase):
 
         route_debug["graph_candidates"] = len(graph_list)
 
-        # ── Merge graph primary candidates. Vector-only entries are fallback only.
+        # ── Merge graph primary candidates. Keep top validator candidates in
+        # the rerank pool even when graph is full, so graph traversal cannot
+        # crowd out direct vector/BM25 evidence.
         merged_map: Dict[str, Dict] = {}
         for r in graph_list:
             rid = r["id"]
@@ -2812,6 +2815,36 @@ class MAGMemory(MemoryBase):
                 merged_map[rid].setdefault("route_scores", {}).update(r.get("route_scores", {}))
             else:
                 merged_map[rid] = r
+
+        validator_pool_limit = max(limit, min(30, limit * 2))
+        for rid, v in list(validator_map.items())[:validator_pool_limit]:
+            validator_score = v.get("score", 0)
+            if rid in merged_map:
+                route_scores = merged_map[rid].setdefault("route_scores", {})
+                route_scores["validator"] = round(max(route_scores.get("validator", 0), validator_score), 4)
+                route_scores["validator_rank"] = v.get("rank")
+                merged_map[rid]["source"] += "+vector_validator"
+                merged_map[rid]["score"] = max(
+                    merged_map[rid]["score"],
+                    0.75 * merged_map[rid]["score"] + 0.25 * validator_score,
+                )
+                continue
+
+            merged_map[rid] = {
+                "id": rid,
+                "memory": v.get("memory", ""),
+                "score": validator_score * 0.45,
+                "created_at": v.get("created_at", ""),
+                "source": "vector+bm25_validator",
+                "entities": v.get("entities", []),
+                "route_scores": {
+                    "graph": 0.0,
+                    "validator": round(validator_score, 4),
+                    "final_pre_rerank": round(validator_score * 0.45, 4),
+                    "validator_rank": v.get("rank"),
+                },
+            }
+            route_debug["validator_pool_added"] += 1
 
         # Fallback keeps recall when query entities miss the graph or graph pool is too small.
         fallback_needed = max(0, limit - len(merged_map))
