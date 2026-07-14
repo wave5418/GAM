@@ -755,9 +755,23 @@ async def async_main() -> None:
         evidence_lookup = load_evidence_lookup(dataset_path)
         print(f"  Evidence lookup: {len(evidence_lookup)} entries")
 
-    answerer = LLMClient(model=args.answerer_model, provider=args.provider,base_url= "https://dashscope.aliyuncs.com/compatible-mode/v1" , rpm=args.rpm)
+    llm_base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("MAG_LLM_BASE_URL")
+    llm_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MAG_LLM_API_KEY")
+    answerer = LLMClient(
+        model=args.answerer_model,
+        provider=args.provider,
+        api_key=llm_api_key,
+        base_url=llm_base_url,
+        rpm=args.rpm,
+    )
     judge_provider = args.judge_provider or args.provider
-    judge_llm = LLMClient(model=args.judge_model, provider=judge_provider, base_url= "https://dashscope.aliyuncs.com/compatible-mode/v1", rpm=args.rpm)
+    judge_llm = LLMClient(
+        model=args.judge_model,
+        provider=judge_provider,
+        api_key=llm_api_key,
+        base_url=llm_base_url,
+        rpm=args.rpm,
+    )
 
     if args.evaluate_only:
         expected_items = expected_locomo_question_items(
