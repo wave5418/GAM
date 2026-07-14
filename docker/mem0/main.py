@@ -177,6 +177,7 @@ class AddRequest(BaseModel):
     agent_id: str | None = None
     run_id: str | None = None
     metadata: dict[str, Any] | None = None
+    timestamp: int | None = None  # LOCOMO session epoch
     observation_date: str | None = None
     custom_instructions: str | None = None
 
@@ -200,8 +201,12 @@ class UpdateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
 @app.post("/memories")
-def add_memories(req: AddRequest):
+async def add_memories(req: AddRequest):
     """Add memories extracted from a conversation."""
     mem = _get_memory()
     params: dict[str, Any] = {}
@@ -215,11 +220,14 @@ def add_memories(req: AddRequest):
         params["metadata"] = req.metadata
     # observation_date and custom_instructions: pass through only if
     # the installed mem0ai version supports them
+    if req.timestamp:
+        params["timestamp"] = req.timestamp
     if req.custom_instructions:
         params["prompt"] = req.custom_instructions
 
     try:
-        result = mem.add(req.messages, **params)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(_EXECUTOR, lambda: mem.add(req.messages, **params))
         return result
     except Exception as e:
         logger.exception("add() failed")
@@ -227,23 +235,27 @@ def add_memories(req: AddRequest):
 
 
 @app.post("/search")
-def search_memories(req: SearchRequest):
+async def search_memories(req: SearchRequest):
     """Search memories by semantic similarity + BM25 + entity boost."""
     mem = _get_memory()
-    params: dict[str, Any] = {"limit": req.limit}
+    # mem0>=2.0 expects `top_k` (not `limit`); passing `limit` is ignored and
+    # silently falls back to default top_k=20.
+    params: dict[str, Any] = {"top_k": req.limit}
+    merged_filters: dict[str, Any] = dict(req.filters or {})
     if req.user_id:
-        params["user_id"] = req.user_id
+        merged_filters["user_id"] = req.user_id
     if req.agent_id:
-        params["agent_id"] = req.agent_id
+        merged_filters["agent_id"] = req.agent_id
     if req.run_id:
-        params["run_id"] = req.run_id
-    if req.filters:
-        params["filters"] = req.filters
+        merged_filters["run_id"] = req.run_id
+    if merged_filters:
+        params["filters"] = merged_filters
     if req.rerank:
         params["rerank"] = True
 
     try:
-        result = mem.search(req.query, **params)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(_EXECUTOR, lambda: mem.search(req.query, **params))
         return result
     except Exception as e:
         logger.exception("search() failed")

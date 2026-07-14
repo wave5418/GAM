@@ -44,7 +44,14 @@ from tqdm import tqdm
 
 from benchmarks.common.llm_client import LLMClient
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
-from benchmarks.common.mag_client import MAGClient
+
+# ── MAG: 替换 mem0 实现 ──
+sys.path.insert(0, "/home/lhw/MAG")
+from mag_memory.core import MAGMemory
+from mag_memory.benchmark_adapter import MAGBenchmarkClient
+from mem0.configs.base import MemoryConfig
+
+load_dotenv("/home/lhw/MAG/mag_memory/.env.mag", override=True)
 from benchmarks.common.metrics import compute_overall_metrics
 from benchmarks.common.schema import (
     CutoffResult,
@@ -67,7 +74,7 @@ from benchmarks.common.utils import (
     setup_logging,
 )
 
-from .prompts import (
+from benchmarks.locomo.prompts import (
     CATEGORIES_TO_EVALUATE,
     CATEGORY_NAMES,
     JUDGE_SYSTEM_PROMPT,
@@ -78,10 +85,6 @@ from .prompts import (
 )
 
 load_dotenv(override=True)
-# 统一从 mag/.env.mag 读取所有配置（含 OPENAI_API_KEY）
-_mag_env = os.path.join(os.path.dirname(__file__), "../../mag/.env.mag")
-if os.path.exists(_mag_env):
-    load_dotenv(_mag_env, override=True)
 
 # ===============================================================================
 # CONSTANTS
@@ -391,53 +394,6 @@ async def ingest_conversation(
 # ===============================================================================
 
 
-# ── LongLLMLingua context compression (ablation) ──
-_CONTEXT_COMPRESS_METHOD = None
-_compress_model = None
-_compress_rate = 0.5  # keep 50% of tokens
-
-def compress_context(method: str, question: str, memories: list[dict]) -> list[dict]:
-    """Compress context using LongLLMLingua. Returns filtered memory list."""
-    global _compress_model
-    if not memories:
-        return memories
-    # Build context text: [id] memory_text \n
-    texts = [m.get("memory", "") for m in memories]
-    # Filter out empty and duplicates
-    seen = set()
-    unique_texts = []
-    for t in texts:
-        if t and t not in seen:
-            seen.add(t)
-            unique_texts.append(t)
-    if len(unique_texts) < 2:
-        return memories
-
-    if method == "llmlingua":
-        # LongLLMLingua token 级压缩：逐句独立压缩，保留关键 token
-        if _compress_model is None:
-            from llmlingua import PromptCompressor
-            _compress_model = PromptCompressor(model_name="microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank",
-                                               use_llmlingua2=True)
-        try:
-            result = []
-            for m in memories:
-                text = m.get("memory", "")
-                if not text.strip(): continue
-                compressed = _compress_model.compress_prompt([text], rate=_compress_rate)
-                ct = compressed.get("compressed_prompt", text).strip()
-                if ct and len(ct) > 3:  # 保留有意义的压缩结果
-                    result.append({**m, "memory": ct})  # 替换为压缩文本
-                else:
-                    result.append(m)
-            print(f"[Compress] {len(memories)} memories token-compressed", flush=True)
-            return result
-        except Exception as e:
-            print(f"[Compress] ERROR: {e}", flush=True)
-            pass
-    return memories
-
-
 async def process_question(
     qa: dict,
     qa_idx: int,
@@ -512,10 +468,6 @@ async def process_question(
     for c in cutoffs:
         sliced = formatted[:c]
         label = cutoff_label(c)
-
-        # Ablation: LongLLMLingua context compression
-        if _CONTEXT_COMPRESS_METHOD and sliced:
-            sliced = compress_context(_CONTEXT_COMPRESS_METHOD, question, sliced)
 
         # Generate answer
         gen_prompt = get_answer_generation_prompt(question, sliced, reference_date=reference_date_human, user_profile=user_profile)
@@ -744,8 +696,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k-cutoffs", default="10,20,50,200", help="Comma-separated cutoffs for evaluation")
     parser.add_argument("--max-workers", type=int, default=10, help="Max parallel workers")
     parser.add_argument("--output-dir", default="results/locomo", help="Output directory")
-    parser.add_argument("--context-compress", default=None, choices=["llmlingua","llmlingua2"],
-                        help="Ablation: compress context before answer (llmlingua / llmlingua2)")
     parser.add_argument("--predict-only", action="store_true", help="Skip answer+judge, only ingest+search")
     parser.add_argument(
         "--evaluate-only",
@@ -767,8 +717,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user-profile", action="store_true", help="Fetch user profiles")
     parser.add_argument("--max-questions", type=int, default=None, help="Max questions to process (for quick testing)")
     parser.add_argument("--rpm", type=int, default=200, help="Requests per minute for LLM")
-    parser.add_argument("--backend", default="oss", choices=["oss", "cloud", "mag", "local"],
-                        help="Memory backend: oss/cloud/mag/local")
+    parser.add_argument("--backend", default="oss", choices=["oss", "cloud"],
+                        help="Mem0 backend: 'oss' for self-hosted server (default), 'cloud' for api.mem0.ai")
     parser.add_argument("--mem0-host", default=None,
                         help="Mem0 server URL (default: http://localhost:8888 for oss, https://api.mem0.ai for cloud)")
     parser.add_argument("--mem0-api-key", default=None,
@@ -782,9 +732,7 @@ def parse_args() -> argparse.Namespace:
 
 
 async def async_main() -> None:
-    global _CONTEXT_COMPRESS_METHOD
     args = parse_args()
-    _CONTEXT_COMPRESS_METHOD = args.context_compress
     logger = setup_logging("locomo", debug=args.debug)
 
     cutoffs = parse_cutoffs(args.top_k_cutoffs)
@@ -814,13 +762,9 @@ async def async_main() -> None:
         evidence_lookup = load_evidence_lookup(dataset_path)
         print(f"  Evidence lookup: {len(evidence_lookup)} entries")
 
-    llm_base = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    llm_key = os.getenv("OPENAI_API_KEY")
-    answerer = LLMClient(model=args.answerer_model, provider=args.provider,
-                         base_url=llm_base, api_key=llm_key, rpm=args.rpm)
+    answerer = LLMClient(model=args.answerer_model, provider=args.provider,base_url= "https://dashscope.aliyuncs.com/compatible-mode/v1" , rpm=args.rpm)
     judge_provider = args.judge_provider or args.provider
-    judge_llm = LLMClient(model=args.judge_model, provider=judge_provider,
-                          base_url=llm_base, api_key=llm_key, rpm=args.rpm)
+    judge_llm = LLMClient(model=args.judge_model, provider=judge_provider, base_url= "https://dashscope.aliyuncs.com/compatible-mode/v1", rpm=args.rpm)
 
     if args.evaluate_only:
         expected_items = expected_locomo_question_items(
@@ -891,17 +835,42 @@ async def async_main() -> None:
         print(f"\nTotal questions evaluated: {len(all_evaluations)}")
         return
 
-    # Init memory backend (oss/cloud/mag)
-    backend = os.getenv("MEM0_BACKEND", args.backend)
-    if backend == "mag":
-        mem0 = MAGClient(project_name=args.project_name)
-    else:
-        mem0 = Mem0Client(
-            mode=backend,
-            host=args.mem0_host,
-            api_key=args.mem0_api_key if backend == "cloud" else None,
-            rpm=args.rpm,
-        )
+    # Init MAG Memory (replaces Mem0)
+    api_key = os.getenv("MAG_LLM_API_KEY")
+    base_url = os.getenv("MAG_LLM_BASE_URL")
+    embed_key = os.getenv("MAG_EMBED_API_KEY")
+    embed_url = os.getenv("MAG_EMBED_BASE_URL")
+
+    mag_config = MemoryConfig(
+        vector_store={"provider": "qdrant", "config": {
+            "host": "localhost", "port": 6333,
+            "collection_name": f"mag_{args.project_name}",
+            "embedding_model_dims": int(os.getenv("MAG_EMBED_DIMS", "1536")),
+        }},
+        llm={"provider": "openai", "config": {
+            "model": os.getenv("MAG_LLM_MODEL", "gpt-4o-mini"),
+            "temperature": 0.1, "api_key": api_key, "openai_base_url": base_url,
+        }},
+        embedder={"provider": "openai", "config": {
+            "model": os.getenv("MAG_EMBED_MODEL", "text-embedding-3-small"),
+            "api_key": embed_key, "openai_base_url": embed_url,
+            "embedding_dims": int(os.getenv("MAG_EMBED_DIMS", "1536")),
+        }},
+        history_db_path=f"/tmp/mag_{args.project_name}.db", version="v1.1",
+    )
+
+    memory = MAGMemory(
+        mag_config, mag_enabled=True, segmentation_strategy="nlp",
+        entity_strategy="spacy", attention_strategy="off",
+        linear_rag_config={
+            "enabled": False,
+            "relation_batch_size": int(os.getenv("MAG_RELATION_BATCH", "0")),
+            "use_entity_store": False,  # 关掉加速: 避免每个 entity 单独调 embedding
+            "use_history": True,
+            "use_dedup": True,
+        },
+    )
+    mem0 = MAGBenchmarkClient(memory)
     shutdown = GracefulShutdown()
     checkpoint = Checkpoint(output_dir)
 
@@ -943,11 +912,10 @@ async def async_main() -> None:
             if not success:
                 logger.error("Ingestion failed for conversation %d", conv_idx)
 
-            # MAG: flush pending graph relations after all chunks ingested
-            if backend == "mag" and hasattr(mem0, 'flush_relations'):
-                await mem0.flush_relations()
-                if hasattr(mem0, 'flush_edge_sentences'):
-                    await mem0.flush_edge_sentences()
+            # ── MAG: flush pending relations (batch LLM call for all accumulated entity pairs) ──
+            if hasattr(mem0, 'flush_relations'):
+                flush_r = await mem0.flush_relations()
+                logger.info("MAG flush: %s", flush_r)
 
             if shutdown.requested:
                 return

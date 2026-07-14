@@ -10,8 +10,9 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download spaCy English model (used for entity extraction + lemmatization)
-RUN python -m spacy download en_core_web_sm
+# Download spaCy English model (used for entity extraction + lemmatization).
+# Allow build to continue when external model host is unreachable.
+RUN python -m spacy download en_core_web_sm || true
 
 # Allow "sagemaker" as an embedding provider in mem0's config validator
 RUN sed -i 's/"aws_bedrock",/"aws_bedrock", "sagemaker",/' \

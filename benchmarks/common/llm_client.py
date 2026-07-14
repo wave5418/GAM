@@ -35,6 +35,7 @@ class LLMClient:
 
     Args:
         model: Model identifier (e.g., "gpt-4o", "claude-sonnet-4-20250514").
+        model_name: Alias of model. If set, it takes precedence over model.
         provider: One of "openai", "anthropic", "azure".
         api_key: API key. Falls back to provider-specific env vars.
         base_url: Custom base URL (OpenAI-compatible providers).
@@ -45,16 +46,17 @@ class LLMClient:
 
     def __init__(
         self,
-        model: str = "gpt-4o",
+        model: str | None = None,
+        model_name: str | None = None,
         provider: str = "openai",
         api_key: str | None = None,
-        base_url: str | None = None,
+        base_url: str | None = "https://dashscope.aliyuncs.com/compatible-mode/v1",
         max_retries: int = 5,
         rpm: int = 200,
         timeout: float = 120.0,
         **kwargs: Any,
     ):
-        self.model = model
+        self.model = model_name or model or "qwen-turbo"
         self.provider = provider.lower()
         self.max_retries = max_retries
         self.limiter = AsyncLimiter(rpm, 60)

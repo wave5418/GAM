@@ -1,4 +1,23 @@
 services:
+  neo4j:
+    image: neo4j:5
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    environment:
+      - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/neo4jpassword}
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=512m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
   mem0:
     build:
       context: ./docker/mem0
@@ -25,8 +44,7 @@ services:
     volumes:
       - mem0_history:/app/history
       # Custom config for advanced setups (Azure, Ollama, SageMaker, etc.)
-      # Uncomment and point to your config file:
-      # - ./mem0-config.yaml:/app/config.yaml:ro
+      - ./mem0-config.yaml:/app/config.yaml:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -50,3 +68,5 @@ services:
 volumes:
   qdrant_data:
   mem0_history:
+  neo4j_data:
+  neo4j_logs:

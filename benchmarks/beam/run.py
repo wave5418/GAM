@@ -76,6 +76,10 @@ from .prompts import (
 )
 
 load_dotenv(override=True)
+# 统一从 mag/.env.mag 读取所有配置
+_mag_env = os.path.join(os.path.dirname(__file__), "../../mag/.env.mag")
+if os.path.exists(_mag_env):
+    load_dotenv(_mag_env, override=True)
 
 # ===============================================================================
 # CONSTANTS

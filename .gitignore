@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+docker/mem0/vendor/
 
 # Database
 evals.db
@@ -23,12 +24,15 @@ evaluation_results/
 
 # Environment
 .env
+.env.*
+!.env.example
 .env.local
 .env.*.local
 
 # IDE
 .vscode/
 .idea/
+.pytest_cache/
 *.swp
 *.swo
 .DS_Store

@@ -33,10 +33,10 @@ logger = logging.getLogger(__name__)
 
 
 class Mem0Client:
-    """Async Mem0 client supporting both OSS server and cloud API.
+    """Async Mem0 client supporting OSS server, cloud API, and direct local mode.
 
     Args:
-        mode: "oss" for self-hosted server, "cloud" for api.mem0.ai.
+        mode: "oss" for self-hosted server, "cloud" for api.mem0.ai, "local" for direct mem0 library.
         host: Server URL. Defaults to MEM0_HOST env or http://localhost:8888 (oss)
               / https://api.mem0.ai (cloud).
         api_key: Cloud API key. Falls back to MEM0_API_KEY env var. (cloud mode only)
@@ -68,6 +68,8 @@ class Mem0Client:
 
         if mode == "cloud":
             default_host = "https://api.mem0.ai"
+        elif mode == "local":
+            default_host = ""  # not used
         else:
             default_host = "http://localhost:8888"
 
@@ -82,6 +84,26 @@ class Mem0Client:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.limiter = AsyncLimiter(100000, 60)  # no client-side rate limiting
         self._session: aiohttp.ClientSession | None = None
+
+        # Local mode: init mem0 Memory directly
+        self._local_memory = None
+        if mode == "local":
+            import os as _os
+            from mem0 import Memory as _Memory
+            _key = _os.environ.get('OPENAI_API_KEY', '')
+            self._local_memory = _Memory.from_config(config_dict={
+                'llm': {'provider': 'openai', 'config': {
+                    'model': 'gpt-4o-mini', 'api_key': _key,
+                    'openai_base_url': 'https://api2.aigcbest.top/v1',
+                }},
+                'embedder': {'provider': 'fastembed', 'config': {
+                    'model': 'BAAI/bge-small-en-v1.5', 'embedding_dims': 384,
+                }},
+                'vector_store': {'provider': 'qdrant', 'config': {
+                    'host': 'localhost', 'port': 6333, 'embedding_model_dims': 384,
+                }},
+                'history_db_path': _os.path.expanduser('~/.mem0/local_bench.db'),
+            })
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -129,6 +151,8 @@ class Mem0Client:
         """
         if self.mode == "oss":
             return await self._add_oss(messages, user_id, observation_date, timestamp, custom_instructions, metadata)
+        elif self.mode == "local":
+            return await self._add_local(messages, user_id, observation_date=observation_date, timestamp=timestamp, custom_instructions=custom_instructions, metadata=metadata)
         else:
             return await self._add_cloud(messages, user_id, observation_date, timestamp, custom_instructions, metadata)
 
@@ -178,6 +202,49 @@ class Mem0Client:
                 else:
                     logger.error("ADD failed after %d attempts for user=%s", self.max_retries, user_id)
                     return None
+
+    async def _add_local(
+        self, messages, user_id, observation_date=None, timestamp=None, custom_instructions=None, metadata=None,
+    ) -> dict | None:
+        """Add via direct mem0 Memory API — no HTTP server."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        try:
+            kwargs = {'user_id': user_id}
+            if timestamp is not None:
+                kwargs['timestamp'] = timestamp
+            result = await loop.run_in_executor(None, lambda: self._local_memory.add(messages, **kwargs))
+            return result if isinstance(result, dict) else {"results": result if isinstance(result, list) else []}
+        except Exception as e:
+            logger.warning("Local ADD failed: %s", str(e)[:200])
+            return None
+
+    async def _search_local(self, query, user_id, top_k) -> list[dict]:
+        """Search via direct mem0 Memory API — no HTTP server."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(None, lambda: self._local_memory.search(
+                query, filters={'user_id': user_id}, top_k=top_k
+            ))
+            results = result.get("results", []) if isinstance(result, dict) else result
+            if not isinstance(results, list):
+                results = []
+            normalised = []
+            for r in results:
+                entry = {
+                    "memory": r.get("memory", ""),
+                    "score": r.get("score", 0),
+                    "id": r.get("id", ""),
+                }
+                if r.get("created_at"): entry["created_at"] = r["created_at"]
+                if r.get("updated_at"): entry["updated_at"] = r["updated_at"]
+                normalised.append(entry)
+            normalised.sort(key=lambda x: x.get("score", 0), reverse=True)
+            return normalised
+        except Exception as e:
+            logger.warning("Local SEARCH failed: %s", str(e)[:200])
+            return []
 
     async def _add_cloud(
         self, messages, user_id, observation_date, timestamp, custom_instructions, metadata,
@@ -249,6 +316,8 @@ class Mem0Client:
         """Search memories. Returns list of results sorted by score descending."""
         if self.mode == "oss":
             return await self._search_oss(query, user_id, top_k, rerank)
+        elif self.mode == "local":
+            return await self._search_local(query, user_id, top_k)
         else:
             return await self._search_cloud(query, user_id, top_k, rerank, score_debug)
 
@@ -467,6 +536,8 @@ def format_search_results(search_results: list[dict]) -> tuple[list[dict], dict 
             "score": r.get("score", 0),
             "id": r.get("id", ""),
         }
+        if r.get("source"):
+            entry["source"] = r["source"]
         if r.get("created_at"):
             entry["created_at"] = r["created_at"]
         if r.get("updated_at"):
