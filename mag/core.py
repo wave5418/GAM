@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 import warnings
 from copy import deepcopy
@@ -67,6 +68,112 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*swigva
 
 # Initialize logger early for util functions
 logger = logging.getLogger(__name__)
+
+_MAG_EVIDENCE_STOPWORDS = frozenset({
+    "about",
+    "after",
+    "again",
+    "also",
+    "and",
+    "any",
+    "are",
+    "before",
+    "both",
+    "but",
+    "can",
+    "could",
+    "date",
+    "did",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "her",
+    "him",
+    "his",
+    "how",
+    "into",
+    "its",
+    "last",
+    "many",
+    "month",
+    "more",
+    "most",
+    "much",
+    "next",
+    "not",
+    "own",
+    "said",
+    "she",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "they",
+    "this",
+    "time",
+    "was",
+    "week",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "would",
+    "year",
+})
+
+_MAG_TEMPORAL_TERMS = frozenset({
+    "after",
+    "before",
+    "date",
+    "day",
+    "friday",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "last",
+    "monday",
+    "month",
+    "next",
+    "saturday",
+    "sunday",
+    "thursday",
+    "time",
+    "today",
+    "tomorrow",
+    "tuesday",
+    "wednesday",
+    "week",
+    "when",
+    "year",
+    "yesterday",
+})
+
+_MAG_DATE_RE = re.compile(
+    r"\b(?:20\d{2}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|"
+    r"mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|"
+    r"sat(?:urday)?|sun(?:day)?|yesterday|tomorrow|last|next)\b",
+    re.IGNORECASE,
+)
 
 
 # Fields that hold runtime auth/connection objects and must be preserved.
@@ -240,6 +347,80 @@ def _normalize_iso_timestamp_to_utc(timestamp: Optional[str]) -> Optional[str]:
     if parsed.tzinfo is None:
         return timestamp
     return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _mag_text_tokens(text: Any) -> Set[str]:
+    """Return content-bearing lowercase tokens for lightweight evidence checks."""
+    tokens = re.findall(r"[a-z0-9]+", str(text).lower())
+    return {
+        token
+        for token in tokens
+        if len(token) > 2 and token not in _MAG_EVIDENCE_STOPWORDS
+    }
+
+
+def _mag_jaccard(left: Set[str], right: Set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(1, len(left | right))
+
+
+def _mag_candidate_evidence_features(query: str, candidate: Dict[str, Any]) -> Dict[str, float]:
+    """Compute small, inspectable retrieval-time evidence features."""
+    memory = candidate.get("memory", "")
+    q_tokens = _mag_text_tokens(query)
+    m_tokens = _mag_text_tokens(memory)
+    coverage = len(q_tokens & m_tokens) / max(1, len(q_tokens))
+
+    query_terms = set(re.findall(r"[a-z0-9]+", str(query).lower()))
+    query_is_temporal = bool(_MAG_TEMPORAL_TERMS & query_terms)
+    memory_has_date = bool(_MAG_DATE_RE.search(memory) or _MAG_DATE_RE.search(str(candidate.get("created_at", ""))))
+    date_boost = 1.0 if query_is_temporal and memory_has_date else 0.0
+
+    # Long path contexts can be useful, but very broad snippets often bury the
+    # atomic answer and have caused distractor wins in LOCOMO.
+    text_len = len(str(memory))
+    length_penalty = 0.0
+    if text_len > 1800:
+        length_penalty = min(0.08, (text_len - 1800) / 10000)
+
+    evidence_score = min(1.0, (0.75 * coverage) + (0.25 * date_boost))
+    return {
+        "query_coverage": round(coverage, 4),
+        "temporal_cue": date_boost,
+        "length_penalty": round(length_penalty, 4),
+        "evidence_score": round(evidence_score, 4),
+    }
+
+
+def _mag_diverse_topk(candidates: List[Dict[str, Any]], limit: int, pool_size: int) -> List[Dict[str, Any]]:
+    """Select high-scoring candidates while reducing near-duplicate evidence."""
+    if limit <= 0 or len(candidates) <= limit:
+        return candidates[:limit]
+
+    pool = candidates[:pool_size]
+    selected: List[Dict[str, Any]] = []
+    selected_tokens: List[Set[str]] = []
+    max_score = max((c.get("score", 0.0) for c in pool), default=1.0) or 1.0
+
+    while pool and len(selected) < limit:
+        best_idx = 0
+        best_score = float("-inf")
+        for idx, candidate in enumerate(pool):
+            tokens = _mag_text_tokens(candidate.get("memory", ""))
+            similarity = max((_mag_jaccard(tokens, seen) for seen in selected_tokens), default=0.0)
+            normalized_score = candidate.get("score", 0.0) / max_score
+            mmr_score = (0.82 * normalized_score) - (0.18 * similarity)
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best_idx = idx
+        chosen = pool.pop(best_idx)
+        selected.append(chosen)
+        selected_tokens.append(_mag_text_tokens(chosen.get("memory", "")))
+
+    if len(selected) < limit:
+        selected.extend(candidates[len(selected):limit])
+    return selected
 
 
 def _build_filters_and_metadata(
@@ -2647,6 +2828,8 @@ class MAGMemory(MemoryBase):
             "validator_pool_added": 0,
             "vector_fallback_added": 0,
             "context_support_attached": 0,
+            "evidence_quality_adjusted": 0,
+            "diversity_pool_size": 0,
         }
 
         try:
@@ -2897,6 +3080,23 @@ class MAGMemory(MemoryBase):
                         r["score"] = r.get("score", 0) + boost
                 merged_list.sort(key=lambda x: x["score"], reverse=True)
 
+        # ── Evidence quality features: favor direct lexical/date support and
+        # mildly penalize broad path contexts before cross-encoder rerank.
+        for r in merged_list:
+            features = _mag_candidate_evidence_features(query, r)
+            route_scores = r.setdefault("route_scores", {})
+            route_scores.update(features)
+            base_score = r.get("score", 0.0)
+            adjustment = (
+                base_score * 0.10 * features["evidence_score"]
+                - base_score * features["length_penalty"]
+            )
+            if adjustment:
+                r["score"] = max(0.0, base_score + adjustment)
+                route_scores["evidence_adjustment"] = round(adjustment, 4)
+                route_debug["evidence_quality_adjusted"] += 1
+        merged_list.sort(key=lambda x: x["score"], reverse=True)
+
         # ── Rerank (CrossEncoder, 可 ablation: mag_use_rerank=False) ──
         if self.mag_use_rerank and self._reranker is not None and merged_list:
             rerank_pool = merged_list[: max(limit * 3, 60)]
@@ -2983,7 +3183,9 @@ class MAGMemory(MemoryBase):
                     pass
             merged_list.sort(key=lambda x: x["score"], reverse=True)
 
-        final = merged_list[:limit]
+        diversity_pool_size = min(len(merged_list), max(limit * 4, 60))
+        route_debug["diversity_pool_size"] = diversity_pool_size
+        final = _mag_diverse_topk(merged_list, limit, diversity_pool_size)
 
         # ── 上下文组装 ──
         ctx_lines = ["[Relevant Past Memories]\n"]
