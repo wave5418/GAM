@@ -44,14 +44,7 @@ from tqdm import tqdm
 
 from benchmarks.common.llm_client import LLMClient
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
-
-# ── MAG: 替换 mem0 实现 ──
-sys.path.insert(0, "/home/lhw/MAG")
-from mag_memory.core import MAGMemory
-from mag_memory.benchmark_adapter import MAGBenchmarkClient
-from mem0.configs.base import MemoryConfig
-
-load_dotenv("/home/lhw/MAG/mag_memory/.env.mag", override=True)
+from benchmarks.common.mag_client import MAGClient
 from benchmarks.common.metrics import compute_overall_metrics
 from benchmarks.common.schema import (
     CutoffResult,
@@ -835,42 +828,9 @@ async def async_main() -> None:
         print(f"\nTotal questions evaluated: {len(all_evaluations)}")
         return
 
-    # Init MAG Memory (replaces Mem0)
-    api_key = os.getenv("MAG_LLM_API_KEY")
-    base_url = os.getenv("MAG_LLM_BASE_URL")
-    embed_key = os.getenv("MAG_EMBED_API_KEY")
-    embed_url = os.getenv("MAG_EMBED_BASE_URL")
-
-    mag_config = MemoryConfig(
-        vector_store={"provider": "qdrant", "config": {
-            "host": "localhost", "port": 6333,
-            "collection_name": f"mag_{args.project_name}",
-            "embedding_model_dims": int(os.getenv("MAG_EMBED_DIMS", "1536")),
-        }},
-        llm={"provider": "openai", "config": {
-            "model": os.getenv("MAG_LLM_MODEL", "gpt-4o-mini"),
-            "temperature": 0.1, "api_key": api_key, "openai_base_url": base_url,
-        }},
-        embedder={"provider": "openai", "config": {
-            "model": os.getenv("MAG_EMBED_MODEL", "text-embedding-3-small"),
-            "api_key": embed_key, "openai_base_url": embed_url,
-            "embedding_dims": int(os.getenv("MAG_EMBED_DIMS", "1536")),
-        }},
-        history_db_path=f"/tmp/mag_{args.project_name}.db", version="v1.1",
-    )
-
-    memory = MAGMemory(
-        mag_config, mag_enabled=True, segmentation_strategy="nlp",
-        entity_strategy="spacy", attention_strategy="off",
-        linear_rag_config={
-            "enabled": False,
-            "relation_batch_size": int(os.getenv("MAG_RELATION_BATCH", "0")),
-            "use_entity_store": False,  # 关掉加速: 避免每个 entity 单独调 embedding
-            "use_history": True,
-            "use_dedup": True,
-        },
-    )
-    mem0 = MAGBenchmarkClient(memory)
+    # Init local MAG implementation. MAGClient loads mag/.env.mag and preserves
+    # LOCOMO timestamps when ingesting sessions.
+    mem0 = MAGClient(project_name=args.project_name)
     shutdown = GracefulShutdown()
     checkpoint = Checkpoint(output_dir)
 
