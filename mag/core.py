@@ -2811,7 +2811,13 @@ class MAGMemory(MemoryBase):
             return None
 
     def _mag_search(self, query: str, filters, limit: int) -> Dict[str, Any]:
-        """MAG graph-first retrieval: graph pool first, vector/BM25 as validator."""
+        """MAG retrieval with vector/BM25 as the primary recall route.
+
+        Graph BFS is intentionally conservative: it can reinforce direct
+        vector/BM25 hits or add a small number of supplemental candidates, but
+        it must not crowd out the validator route that carries the strongest
+        lexical/semantic evidence in LOCOMO.
+        """
         from mem0.utils.entity_extraction import extract_entities as _ext_ent
 
         filters = filters or {}
@@ -2846,7 +2852,8 @@ class MAGMemory(MemoryBase):
                     if len(word) > 2:
                         qews.append(EntityWeight(name=word, attention_weight=0.4, entity_type="TOKEN"))
 
-        # ── Validator route: vector+BM25 is computed early but does not seed the pool.
+        # ── Primary validator route: vector+BM25 seeds the pool. BFS may
+        # supplement or reinforce it, but not replace these direct candidates.
         try:
             raw_results = self._search_vector_store(
                 query,
@@ -2872,7 +2879,7 @@ class MAGMemory(MemoryBase):
                 }
         route_debug["validator_candidates"] = len(validator_map)
 
-        # ── Primary route: graph-first candidate generation.
+        # ── Supplemental route: graph BFS candidate generation.
         graph_list: List[Dict[str, Any]] = []
         if self.mag_use_bfs and qews:
             try:
@@ -2946,7 +2953,14 @@ class MAGMemory(MemoryBase):
                     candidate_id = scoped_payloads[-1][0]
                     validator = validator_map.get(candidate_id)
                     validator_score = validator.get("score", 0.0) if validator else 0.0
-                    final_score = (0.65 * graph_score) + (0.35 * validator_score)
+                    if validator:
+                        # Validated graph paths are useful as a weak boost, but
+                        # the original vector/BM25 memory stays authoritative.
+                        final_score = validator_score + (0.12 * graph_score)
+                    else:
+                        # Unvalidated graph-only paths are noisy in LOCOMO. Let
+                        # them compete as backfill, not as primary evidence.
+                        final_score = 0.25 * graph_score
 
                     ctx_lines, path_ts = [], ""
                     all_entities = []
@@ -2963,9 +2977,10 @@ class MAGMemory(MemoryBase):
                         continue
 
                     triple_strs = [f"({h} {r} {t})" for h, r, t in path_info.get("triples", [])]
-                    memory = "\n".join(ctx_lines)
+                    graph_memory = "\n".join(ctx_lines)
                     if triple_strs:
-                        memory += "\n[triples: " + "; ".join(triple_strs) + "]"
+                        graph_memory += "\n[triples: " + "; ".join(triple_strs) + "]"
+                    memory = validator.get("memory", "") if validator else graph_memory
 
                     graph_list.append({
                         "id": candidate_id,
@@ -2982,53 +2997,54 @@ class MAGMemory(MemoryBase):
                         },
                         "graph_path": path_info.get("path", []),
                     })
+                    if validator:
+                        graph_list[-1]["supporting_graph_context"] = graph_memory
             except Exception as e:
                 logger.debug("BFS: %s", str(e)[:100])
 
         route_debug["graph_candidates"] = len(graph_list)
 
-        # ── Merge graph primary candidates. Keep top validator candidates in
-        # the rerank pool even when graph is full, so graph traversal cannot
-        # crowd out direct vector/BM25 evidence.
+        # ── Merge validator-primary candidates first. Keep their native score
+        # and text; graph hits can only reinforce them.
         merged_map: Dict[str, Dict] = {}
-        for r in graph_list:
-            rid = r["id"]
-            if rid in merged_map:
-                merged_map[rid]["score"] = max(merged_map[rid]["score"], r["score"])
-                merged_map[rid]["source"] += "+graph_path"
-                merged_map[rid].setdefault("route_scores", {}).update(r.get("route_scores", {}))
-            else:
-                merged_map[rid] = r
-
-        validator_pool_limit = max(limit, min(30, limit * 2))
+        validator_pool_limit = max(limit * 4, 60)
         for rid, v in list(validator_map.items())[:validator_pool_limit]:
             validator_score = v.get("score", 0)
-            if rid in merged_map:
-                route_scores = merged_map[rid].setdefault("route_scores", {})
-                route_scores["validator"] = round(max(route_scores.get("validator", 0), validator_score), 4)
-                route_scores["validator_rank"] = v.get("rank")
-                merged_map[rid]["source"] += "+vector_validator"
-                merged_map[rid]["score"] = max(
-                    merged_map[rid]["score"],
-                    0.75 * merged_map[rid]["score"] + 0.25 * validator_score,
-                )
-                continue
-
             merged_map[rid] = {
                 "id": rid,
                 "memory": v.get("memory", ""),
-                "score": validator_score * 0.45,
+                "score": validator_score,
                 "created_at": v.get("created_at", ""),
                 "source": "vector+bm25_validator",
                 "entities": v.get("entities", []),
                 "route_scores": {
                     "graph": 0.0,
                     "validator": round(validator_score, 4),
-                    "final_pre_rerank": round(validator_score * 0.45, 4),
+                    "final_pre_rerank": round(validator_score, 4),
                     "validator_rank": v.get("rank"),
                 },
             }
             route_debug["validator_pool_added"] += 1
+
+        graph_only_added = 0
+        graph_only_limit = max(2, limit // 5)
+        for r in graph_list:
+            rid = r["id"]
+            if rid in merged_map:
+                graph_scores = r.get("route_scores", {})
+                route_scores = merged_map[rid].setdefault("route_scores", {})
+                route_scores["graph"] = max(route_scores.get("graph", 0), graph_scores.get("graph", 0))
+                route_scores["graph_path_len"] = graph_scores.get("path_len", 0)
+                route_scores["graph_reinforced"] = 1.0
+                merged_map[rid]["source"] += "+graph_bfs"
+                merged_map[rid]["score"] = max(merged_map[rid]["score"], r["score"])
+                if r.get("supporting_graph_context"):
+                    merged_map[rid]["supporting_graph_context"] = r["supporting_graph_context"]
+            else:
+                if graph_only_added >= graph_only_limit:
+                    continue
+                merged_map[rid] = r
+                graph_only_added += 1
 
         # Fallback keeps recall when query entities miss the graph or graph pool is too small.
         fallback_needed = max(0, limit - len(merged_map))
@@ -3099,7 +3115,11 @@ class MAGMemory(MemoryBase):
 
         # ── Rerank (CrossEncoder, 可 ablation: mag_use_rerank=False) ──
         if self.mag_use_rerank and self._reranker is not None and merged_list:
-            rerank_pool = merged_list[: max(limit * 3, 60)]
+            rerank_pool_size = max(limit * 3, 60)
+            protected_validator_ids = set(list(validator_map.keys())[:min(len(validator_map), rerank_pool_size)])
+            protected = [r for r in merged_list if r.get("id") in protected_validator_ids]
+            rest = [r for r in merged_list if r.get("id") not in protected_validator_ids]
+            rerank_pool = (protected + rest)[:rerank_pool_size]
             pairs = [(query, r.get("memory", "")) for r in rerank_pool if r.get("memory")]
             if pairs:
                 try:
@@ -3109,7 +3129,13 @@ class MAGMemory(MemoryBase):
                     for i, (r, rr) in enumerate(zip(valid, scores)):
                         rr_norm = 1.0 / (1.0 + _math.exp(-float(rr)))
                         r["rerank_score"] = rr_norm
-                        r["score"] = 0.3 * r.get("score", 0) + 0.7 * rr_norm
+                        source = r.get("source", "")
+                        if source == "graph_bfs":
+                            r["score"] = 0.75 * r.get("score", 0) + 0.25 * rr_norm
+                        elif "vector+bm25" in source:
+                            r["score"] = 0.45 * r.get("score", 0) + 0.55 * rr_norm
+                        else:
+                            r["score"] = 0.55 * r.get("score", 0) + 0.45 * rr_norm
                 except Exception as e:
                     logger.debug("Rerank: %s", str(e)[:100])
             merged_list.sort(key=lambda x: x["score"], reverse=True)
