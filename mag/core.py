@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
 import uuid
 import warnings
 from copy import deepcopy
@@ -596,6 +598,7 @@ class MAGMemory(MemoryBase):
         self._pending_uid: str = ""  # 跟踪当前积累的 user_id，跨对话自动 flush
         self._mag_sentence_scopes: Dict[str, str] = {}
         self._graph_path = (graph_config or {}).get("persist_path", "/tmp/mag_graph.json")
+        self._graph_save_lock = threading.Lock()
 
         if mag_enabled:
             llm = self.llm
@@ -2722,20 +2725,38 @@ class MAGMemory(MemoryBase):
         return default_scope or ""
 
     def _graph_save(self):
-        """持久化图到 JSON 文件 (线程安全: 先拷贝再写入)"""
+        """持久化图到 JSON 文件 (线程安全: 先拷贝再原子替换)"""
         import json as _json
         g = self.graph_store.graph
-        try:
-            entities = {n: dict(g.nodes[n]) for n in list(g.nodes)}
-            edges = [
-                {"u": u, "v": v, "key": k, "data": dict(d)}
-                for u, v, k, d in list(g.edges(keys=True, data=True))
-            ]
-        except RuntimeError:
-            return  # 图正在被修改，跳过本次保存
-        data = {"entities": entities, "edges": edges}
-        with open(self._graph_path, "w") as f:
-            _json.dump(data, f, default=str)
+        with self._graph_save_lock:
+            try:
+                entities = {n: dict(g.nodes[n]) for n in list(g.nodes)}
+                edges = [
+                    {"u": u, "v": v, "key": k, "data": dict(d)}
+                    for u, v, k, d in list(g.edges(keys=True, data=True))
+                ]
+            except RuntimeError:
+                return  # 图正在被修改，跳过本次保存
+            data = {"entities": entities, "edges": edges}
+            graph_dir = os.path.dirname(os.path.abspath(self._graph_path)) or "."
+            os.makedirs(graph_dir, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(self._graph_path)}.",
+                suffix=".tmp",
+                dir=graph_dir,
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    _json.dump(data, f, default=str)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, self._graph_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         logger.warning("Graph saved to %s (%d entities, %d edges)",
                        self._graph_path, len(entities), len(edges))
 
