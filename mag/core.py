@@ -178,6 +178,32 @@ _MAG_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MAG_MONTH_TO_NUMBER = {
+    "jan": "01",
+    "january": "01",
+    "feb": "02",
+    "february": "02",
+    "mar": "03",
+    "march": "03",
+    "apr": "04",
+    "april": "04",
+    "may": "05",
+    "jun": "06",
+    "june": "06",
+    "jul": "07",
+    "july": "07",
+    "aug": "08",
+    "august": "08",
+    "sep": "09",
+    "september": "09",
+    "oct": "10",
+    "october": "10",
+    "nov": "11",
+    "november": "11",
+    "dec": "12",
+    "december": "12",
+}
+
 
 # Fields that hold runtime auth/connection objects and must be preserved.
 # These are non-serializable objects (e.g. AWSV4SignerAuth, RequestsHttpConnection)
@@ -462,6 +488,29 @@ def _mag_entity_texts(entities: Any) -> Set[str]:
     return names
 
 
+def _mag_time_constraints_match(time_constraints: Any, memory: Any, created_at: Any = "") -> bool:
+    constraints = [str(term).lower() for term in (time_constraints or []) if str(term or "").strip()]
+    if not constraints:
+        return True
+
+    memory_lower = str(memory or "").lower()
+    created_lower = str(created_at or "").lower()
+    haystack = f"{memory_lower} {created_lower}"
+    created_date = created_lower[:10]
+
+    for term in constraints:
+        if re.search(rf"\b{re.escape(term)}\b", haystack):
+            continue
+        if re.fullmatch(r"20\d{2}", term) and created_date.startswith(term):
+            continue
+        month_number = _MAG_MONTH_TO_NUMBER.get(term)
+        if month_number and re.match(r"20\d{2}-\d{2}", created_date):
+            if created_date[5:7] == month_number:
+                continue
+        return False
+    return True
+
+
 def _mag_bfs_shadow_gate(
     query: str,
     query_plan: Dict[str, Any],
@@ -493,10 +542,7 @@ def _mag_bfs_shadow_gate(
             target_hits += 1
 
     time_constraints = query_plan.get("time_constraints", []) if isinstance(query_plan, dict) else []
-    time_compatible = True
-    if time_constraints:
-        haystack = f"{memory_lower} {created_at}"
-        time_compatible = all(str(term).lower() in haystack for term in time_constraints)
+    time_compatible = _mag_time_constraints_match(time_constraints, memory_lower, created_at)
 
     route_scores = candidate.get("route_scores", {}) if isinstance(candidate.get("route_scores"), dict) else {}
     path_len = int(route_scores.get("path_len", 0) or 0)
@@ -3346,11 +3392,25 @@ class MAGMemory(MemoryBase):
             features = _mag_candidate_evidence_features(query, r)
             route_scores = r.setdefault("route_scores", {})
             route_scores.update(features)
+            query_plan = route_debug.get("query_plan", {})
+            time_constraints = query_plan.get("time_constraints", []) if isinstance(query_plan, dict) else []
+            time_constraint_match = _mag_time_constraints_match(
+                time_constraints,
+                r.get("memory", ""),
+                r.get("created_at", ""),
+            )
+            if time_constraints:
+                route_scores["time_constraint_match"] = 1.0 if time_constraint_match else 0.0
             base_score = r.get("score", 0.0)
             adjustment = (
                 base_score * 0.10 * features["evidence_score"]
                 - base_score * features["length_penalty"]
             )
+            if time_constraints:
+                if time_constraint_match:
+                    adjustment += base_score * 0.08
+                else:
+                    adjustment -= base_score * 0.30
             if adjustment:
                 r["score"] = max(0.0, base_score + adjustment)
                 route_scores["evidence_adjustment"] = round(adjustment, 4)

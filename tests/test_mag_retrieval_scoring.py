@@ -5,6 +5,7 @@ from mag.core import (
     _mag_build_query_plan,
     _mag_candidate_evidence_features,
     _mag_diverse_topk,
+    _mag_time_constraints_match,
 )
 
 
@@ -82,6 +83,12 @@ def test_bfs_shadow_gate_never_blocks_validator_backed_candidate():
 
     assert gate["would_block"] is False
     assert gate["reasons"] == ["validator_backed"]
+
+
+def test_time_constraints_match_month_names_against_iso_dates():
+    assert _mag_time_constraints_match(["may", "2023"], "Evan took a road trip.", "2023-05-24T00:00:00")
+    assert not _mag_time_constraints_match(["may", "2023"], "Evan took a road trip.", "2023-08-24T00:00:00")
+    assert not _mag_time_constraints_match(["may", "2023"], "Maybe Evan took a road trip.", "2023-08-24T00:00:00")
 
 
 def test_diverse_topk_keeps_high_score_but_reduces_duplicate_cluster():
