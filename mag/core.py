@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 import warnings
 from copy import deepcopy
@@ -2856,6 +2857,16 @@ class MAGMemory(MemoryBase):
         query_embedding = None
         query_entities = []
         qews: List[EntityWeight] = []
+        search_started = time.perf_counter()
+        last_timing_mark = search_started
+        timing_ms: Dict[str, float] = {}
+
+        def _mark_timing(stage: str) -> None:
+            nonlocal last_timing_mark
+            now = time.perf_counter()
+            timing_ms[stage] = round((now - last_timing_mark) * 1000, 1)
+            last_timing_mark = now
+
         route_debug = {
             "graph_paths": 0,
             "graph_candidates": 0,
@@ -2865,6 +2876,7 @@ class MAGMemory(MemoryBase):
             "context_support_attached": 0,
             "evidence_quality_adjusted": 0,
             "diversity_pool_size": 0,
+            "timing_ms": timing_ms,
         }
 
         try:
@@ -2880,6 +2892,7 @@ class MAGMemory(MemoryBase):
                 for word in ename.split():
                     if len(word) > 2:
                         qews.append(EntityWeight(name=word, attention_weight=0.4, entity_type="TOKEN"))
+        _mark_timing("entity_extract")
 
         # ── Primary validator route: vector+BM25 seeds the pool. BFS may
         # supplement or reinforce it, but not replace these direct candidates.
@@ -2892,6 +2905,7 @@ class MAGMemory(MemoryBase):
             )
         except Exception:
             raw_results = []
+        _mark_timing("validator_search")
 
         validator_map: Dict[str, Dict[str, Any]] = {}
         for rank, r in enumerate(raw_results):
@@ -2907,6 +2921,7 @@ class MAGMemory(MemoryBase):
                     "metadata": r.get("metadata", {}) if isinstance(r.get("metadata"), dict) else {},
                 }
         route_debug["validator_candidates"] = len(validator_map)
+        _mark_timing("validator_materialize")
 
         # ── Supplemental route: graph BFS candidate generation.
         graph_list: List[Dict[str, Any]] = []
@@ -2964,6 +2979,7 @@ class MAGMemory(MemoryBase):
                     session_scope=session_scope,
                 )
                 route_debug["graph_paths"] = len(bfs_paths)
+                _mark_timing("graph_search_paths")
 
                 for path_info in bfs_paths:
                     scoped_payloads = []
@@ -3028,8 +3044,12 @@ class MAGMemory(MemoryBase):
                     })
                     if validator:
                         graph_list[-1]["supporting_graph_context"] = graph_memory
+                _mark_timing("graph_materialize")
             except Exception as e:
                 logger.debug("BFS: %s", str(e)[:100])
+                _mark_timing("graph_bfs_error")
+        else:
+            _mark_timing("graph_bfs_skipped")
 
         route_debug["graph_candidates"] = len(graph_list)
 
@@ -3100,6 +3120,7 @@ class MAGMemory(MemoryBase):
                     break
 
         merged_list = sorted(merged_map.values(), key=lambda x: x["score"], reverse=True)
+        _mark_timing("merge_routes")
 
         # ── Entity Match Boost: 匹配 query 实体越多的句子加分越多 ──
         if self.mag_use_entity_match and merged_list:
@@ -3124,6 +3145,7 @@ class MAGMemory(MemoryBase):
                         r["entity_match_count"] = matches
                         r["score"] = r.get("score", 0) + boost
                 merged_list.sort(key=lambda x: x["score"], reverse=True)
+        _mark_timing("entity_match")
 
         # ── Evidence quality features: favor direct lexical/date support and
         # mildly penalize broad path contexts before cross-encoder rerank.
@@ -3141,6 +3163,7 @@ class MAGMemory(MemoryBase):
                 route_scores["evidence_adjustment"] = round(adjustment, 4)
                 route_debug["evidence_quality_adjusted"] += 1
         merged_list.sort(key=lambda x: x["score"], reverse=True)
+        _mark_timing("evidence_scoring")
 
         # ── Rerank (CrossEncoder, 可 ablation: mag_use_rerank=False) ──
         if self.mag_use_rerank and self._reranker is not None and merged_list:
@@ -3168,6 +3191,7 @@ class MAGMemory(MemoryBase):
                 except Exception as e:
                     logger.debug("Rerank: %s", str(e)[:100])
             merged_list.sort(key=lambda x: x["score"], reverse=True)
+        _mark_timing("rerank")
 
         # ── LinearRAG ──
         avg_score = sum(c.get("score", 0) for c in merged_list[:limit]) / max(len(merged_list[:limit]), 1)
@@ -3179,6 +3203,7 @@ class MAGMemory(MemoryBase):
                 logger.warning("LinearRAG: %s", str(e)[:100])
 
         merged_list.sort(key=lambda x: x["score"], reverse=True)
+        _mark_timing("linear_rag")
 
         # ── 上下文窗口: prev/next 作为父候选的 supporting text。
         # Do not add neighbor sentences as independent high-score candidates;
@@ -3240,10 +3265,12 @@ class MAGMemory(MemoryBase):
                 except Exception:
                     pass
             merged_list.sort(key=lambda x: x["score"], reverse=True)
+        _mark_timing("context_window")
 
         diversity_pool_size = min(len(merged_list), max(limit * 4, 60))
         route_debug["diversity_pool_size"] = diversity_pool_size
         final = _mag_diverse_topk(merged_list, limit, diversity_pool_size)
+        _mark_timing("diverse_topk")
 
         # ── 上下文组装 ──
         ctx_lines = ["[Relevant Past Memories]\n"]
@@ -3262,6 +3289,7 @@ class MAGMemory(MemoryBase):
             if cnt > 2000: break
             ctx_lines.append(line)
         ctx_lines.append(f"\n[Current Query]\n{query}")
+        _mark_timing("context_build")
 
         route_composition: Dict[str, int] = {}
         for r in final:
@@ -3279,6 +3307,9 @@ class MAGMemory(MemoryBase):
                 metadata["supporting_context"] = r["supporting_context"]
             if r.get("supporting_graph_context"):
                 metadata["supporting_graph_context"] = r["supporting_graph_context"]
+
+        _mark_timing("metadata_attach")
+        timing_ms["total"] = round((time.perf_counter() - search_started) * 1000, 1)
 
         return {"results": final, "context": "\n".join(ctx_lines), "debug": {
             "total": len(merged_list),
