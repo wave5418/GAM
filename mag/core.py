@@ -177,13 +177,6 @@ _MAG_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_MAG_RELATIVE_DATE_RE = re.compile(
-    r"\b(?:yesterday|tomorrow|last|next|ago|today|tonight|"
-    r"mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|"
-    r"sat(?:urday)?|sun(?:day)?|weekend|week|month|year)\b",
-    re.IGNORECASE,
-)
-
 
 # Fields that hold runtime auth/connection objects and must be preserved.
 # These are non-serializable objects (e.g. AWSV4SignerAuth, RequestsHttpConnection)
@@ -374,57 +367,6 @@ def _mag_jaccard(left: Set[str], right: Set[str]) -> float:
     return len(left & right) / max(1, len(left | right))
 
 
-def _mag_analyze_query(query: str) -> Dict[str, Any]:
-    """Classify query needs with deterministic rules for retrieval routing."""
-    q = str(query).lower()
-    terms = set(re.findall(r"[a-z0-9]+", q))
-
-    is_temporal = bool(_MAG_TEMPORAL_TERMS & terms) or bool(
-        re.search(r"\bwhen\b|\bon\s+\d{1,2}\b|\bafter\b|\bbefore\b", q)
-    )
-    is_visual = bool(re.search(r"\b(image|photo|picture|photograph|shown|shows|shared|attached)\b", q))
-    is_count = bool(re.search(r"\bhow many\b|\bnumber of\b|\bcount\b", q))
-    needs_all_instances = bool(re.search(r"\bwhat (?:has|have|items?|things?)\b|\bboth\b|\ball\b|\blist\b", q))
-    is_comparison = bool(re.search(r"\bboth\b|\bsimilar\b|\bcommon\b|\bsame\b|\bcompare\b", q))
-
-    if is_count:
-        answer_shape = "count"
-    elif is_temporal:
-        answer_shape = "date"
-    elif re.search(r"\bwho\b", q):
-        answer_shape = "person"
-    elif re.search(r"\bwould\b|\blikely\b|\byes\b|\bno\b", q):
-        answer_shape = "yes_no"
-    elif needs_all_instances:
-        answer_shape = "list"
-    else:
-        answer_shape = "span"
-
-    if is_temporal:
-        question_type = "temporal"
-    elif is_visual:
-        question_type = "visual"
-    elif is_count:
-        question_type = "count"
-    elif is_comparison or needs_all_instances:
-        question_type = "multi_hop"
-    elif answer_shape == "yes_no":
-        question_type = "open_domain"
-    else:
-        question_type = "entity_fact"
-
-    time_constraints = sorted(_MAG_DATE_RE.findall(query))
-    return {
-        "question_type": question_type,
-        "answer_shape": answer_shape,
-        "is_temporal": is_temporal,
-        "is_visual": is_visual,
-        "needs_all_instances": needs_all_instances,
-        "is_comparison": is_comparison,
-        "time_constraints": time_constraints[:8],
-    }
-
-
 def _mag_add_source(source: str, route: str) -> str:
     """Append a route label once while preserving route order."""
     parts = [part for part in str(source or "").split("+") if part]
@@ -433,11 +375,7 @@ def _mag_add_source(source: str, route: str) -> str:
     return "+".join(parts)
 
 
-def _mag_candidate_evidence_features(
-    query: str,
-    candidate: Dict[str, Any],
-    query_analysis: Optional[Dict[str, Any]] = None,
-) -> Dict[str, float]:
+def _mag_candidate_evidence_features(query: str, candidate: Dict[str, Any]) -> Dict[str, float]:
     """Compute small, inspectable retrieval-time evidence features."""
     memory = candidate.get("memory", "")
     q_tokens = _mag_text_tokens(query)
@@ -445,14 +383,9 @@ def _mag_candidate_evidence_features(
     coverage = len(q_tokens & m_tokens) / max(1, len(q_tokens))
 
     query_terms = set(re.findall(r"[a-z0-9]+", str(query).lower()))
-    query_is_temporal = bool(
-        (query_analysis or {}).get("is_temporal")
-        or (_MAG_TEMPORAL_TERMS & query_terms)
-    )
+    query_is_temporal = bool(_MAG_TEMPORAL_TERMS & query_terms)
     memory_has_date = bool(_MAG_DATE_RE.search(memory) or _MAG_DATE_RE.search(str(candidate.get("created_at", ""))))
-    memory_has_relative_date = bool(_MAG_RELATIVE_DATE_RE.search(memory))
     date_boost = 1.0 if query_is_temporal and memory_has_date else 0.0
-    relative_date_boost = 1.0 if query_is_temporal and memory_has_relative_date else 0.0
 
     # Long path contexts can be useful, but very broad snippets often bury the
     # atomic answer and have caused distractor wins in LOCOMO.
@@ -461,11 +394,10 @@ def _mag_candidate_evidence_features(
     if text_len > 1800:
         length_penalty = min(0.08, (text_len - 1800) / 10000)
 
-    evidence_score = min(1.0, (0.70 * coverage) + (0.20 * date_boost) + (0.10 * relative_date_boost))
+    evidence_score = min(1.0, (0.75 * coverage) + (0.25 * date_boost))
     return {
         "query_coverage": round(coverage, 4),
         "temporal_cue": date_boost,
-        "relative_temporal_cue": relative_date_boost,
         "length_penalty": round(length_penalty, 4),
         "evidence_score": round(evidence_score, 4),
     }
@@ -2919,7 +2851,6 @@ class MAGMemory(MemoryBase):
 
         filters = filters or {}
         session_scope = _build_session_scope(filters)
-        query_analysis = _mag_analyze_query(query)
         graph_pool_limit = min(300, max(limit * 10, 100))
         validator_limit = max(limit * 4, 60)
         query_embedding = None
@@ -2933,9 +2864,7 @@ class MAGMemory(MemoryBase):
             "vector_fallback_added": 0,
             "context_support_attached": 0,
             "evidence_quality_adjusted": 0,
-            "temporal_attention_adjusted": 0,
             "diversity_pool_size": 0,
-            "query_analysis": query_analysis,
         }
 
         try:
@@ -3199,7 +3128,7 @@ class MAGMemory(MemoryBase):
         # ── Evidence quality features: favor direct lexical/date support and
         # mildly penalize broad path contexts before cross-encoder rerank.
         for r in merged_list:
-            features = _mag_candidate_evidence_features(query, r, query_analysis)
+            features = _mag_candidate_evidence_features(query, r)
             route_scores = r.setdefault("route_scores", {})
             route_scores.update(features)
             base_score = r.get("score", 0.0)
@@ -3207,11 +3136,6 @@ class MAGMemory(MemoryBase):
                 base_score * 0.10 * features["evidence_score"]
                 - base_score * features["length_penalty"]
             )
-            if query_analysis.get("is_temporal") and features["relative_temporal_cue"]:
-                temporal_adjustment = base_score * 0.04
-                adjustment += temporal_adjustment
-                route_scores["temporal_attention_adjustment"] = round(temporal_adjustment, 4)
-                route_debug["temporal_attention_adjusted"] += 1
             if adjustment:
                 r["score"] = max(0.0, base_score + adjustment)
                 route_scores["evidence_adjustment"] = round(adjustment, 4)
