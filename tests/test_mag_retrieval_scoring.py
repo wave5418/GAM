@@ -5,6 +5,7 @@ from mag.core import (
     _mag_build_query_plan,
     _mag_candidate_evidence_features,
     _mag_diverse_topk,
+    _mag_recommendation_direction_support,
     _mag_time_constraints_match,
 )
 
@@ -89,6 +90,22 @@ def test_time_constraints_match_month_names_against_iso_dates():
     assert _mag_time_constraints_match(["may", "2023"], "Evan took a road trip.", "2023-05-24T00:00:00")
     assert not _mag_time_constraints_match(["may", "2023"], "Evan took a road trip.", "2023-08-24T00:00:00")
     assert not _mag_time_constraints_match(["may", "2023"], "Maybe Evan took a road trip.", "2023-08-24T00:00:00")
+
+
+def test_recommendation_direction_support_requires_source_to_target():
+    plan = _mag_build_query_plan(
+        "What book recommendations has Joanna given to Nate?",
+        [("PROPER", "Joanna"), ("PROPER", "Nate")],
+    )
+
+    supported = _mag_recommendation_direction_support(plan, "Joanna recommended it to Nate a while back.")
+    unsupported = _mag_recommendation_direction_support(
+        plan,
+        "Joanna is always up for some new book recommendations.",
+    )
+
+    assert supported["direction_supported"] is True
+    assert unsupported["direction_supported"] is False
 
 
 def test_diverse_topk_keeps_high_score_but_reduces_duplicate_cluster():

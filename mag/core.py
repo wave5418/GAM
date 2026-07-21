@@ -511,6 +511,47 @@ def _mag_time_constraints_match(time_constraints: Any, memory: Any, created_at: 
     return True
 
 
+def _mag_recommendation_direction_support(query_plan: Dict[str, Any], memory: Any) -> Dict[str, Any]:
+    terms = set(query_plan.get("must_have_terms", []) if isinstance(query_plan, dict) else [])
+    if "recommendations" not in terms and "recommendation" not in terms:
+        return {"applicable": False, "direction_supported": False}
+
+    target_entities = query_plan.get("target_entities", []) if isinstance(query_plan, dict) else []
+    people: List[str] = []
+    for entity in target_entities:
+        if not isinstance(entity, dict):
+            continue
+        name = str(entity.get("name", "")).strip().lower()
+        entity_type = str(entity.get("type", "")).upper()
+        if name and entity_type in {"PERSON", "PROPER"} and name not in _MAG_TEMPORAL_TERMS:
+            people.append(name)
+    if len(people) < 2:
+        return {"applicable": True, "direction_supported": False}
+
+    source, target = people[0], people[1]
+    text = str(memory or "").lower()
+    action = r"(?:recommend(?:ed|s|ing)?|suggest(?:ed|s|ing)?|share(?:d|s|ing)?|gave|given)"
+    source_to_target = re.search(
+        rf"\b{re.escape(source)}\b.{{0,120}}\b{action}\b.{{0,120}}\b{re.escape(target)}\b",
+        text,
+    )
+    speaker_pronoun_to_target = re.search(
+        rf"^\s*{re.escape(source)}\s*:.*\b{action}\b.{{0,80}}\b(?:it|that|this|one|book|series|novel)\b.{{0,80}}\b{re.escape(target)}\b",
+        text,
+    )
+    target_requesting_source = re.search(
+        rf"\b{re.escape(target)}\b.{{0,80}}\b(?:recommend|suggest|share|give).{{0,80}}\b{re.escape(source)}\b",
+        text,
+    )
+    return {
+        "applicable": True,
+        "source": source,
+        "target": target,
+        "direction_supported": bool(source_to_target or speaker_pronoun_to_target),
+        "reverse_or_requesting": bool(target_requesting_source),
+    }
+
+
 def _mag_bfs_shadow_gate(
     query: str,
     query_plan: Dict[str, Any],
@@ -3411,6 +3452,15 @@ class MAGMemory(MemoryBase):
                     adjustment += base_score * 0.08
                 else:
                     adjustment -= base_score * 0.30
+            recommendation_support = _mag_recommendation_direction_support(query_plan, r.get("memory", ""))
+            if recommendation_support.get("applicable"):
+                route_scores["recommendation_direction_supported"] = (
+                    1.0 if recommendation_support.get("direction_supported") else 0.0
+                )
+                if recommendation_support.get("direction_supported"):
+                    adjustment += base_score * 0.10
+                elif query_plan.get("answer_shape") in {"list", "span"}:
+                    adjustment -= base_score * 0.18
             if adjustment:
                 r["score"] = max(0.0, base_score + adjustment)
                 route_scores["evidence_adjustment"] = round(adjustment, 4)
