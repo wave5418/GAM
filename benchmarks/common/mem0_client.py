@@ -544,5 +544,12 @@ def format_search_results(search_results: list[dict]) -> tuple[list[dict], dict 
             entry["updated_at"] = r["updated_at"]
         if r.get("score_debug"):
             entry["score_debug"] = r["score_debug"]
+        if r.get("entities"):
+            entry["entities"] = r["entities"]
+        if isinstance(r.get("metadata"), dict) and r["metadata"]:
+            entry["metadata"] = r["metadata"]
+        for key in ("user_id", "agent_id", "run_id"):
+            if r.get(key):
+                entry[key] = r[key]
         formatted.append(entry)
     return formatted, query_debug

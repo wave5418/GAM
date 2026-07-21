@@ -80,8 +80,9 @@ class MAGClient:
         if result is None:
             return []
         raw = result.get("results", [])
+        query_debug = result.get("debug") if isinstance(result, dict) else None
         formatted = []
-        for r in raw:
+        for idx, r in enumerate(raw):
             sid = r.get("id", "")[:8]
             ts = r.get("created_at", "")[:10]
             text = r.get("memory", "")
@@ -112,10 +113,31 @@ class MAGClient:
                 "entities": entities,
                 "source": r.get("source", ""),  # 追踪检索来源
             }
+            metadata = r.get("metadata", {})
+            if isinstance(metadata, dict) and metadata:
+                entry["metadata"] = metadata
+            route_scores = r.get("route_scores")
+            if isinstance(route_scores, dict):
+                entry.setdefault("metadata", {})["route_scores"] = route_scores
+            if r.get("rerank_score") is not None:
+                entry.setdefault("metadata", {})["rerank_score"] = r.get("rerank_score")
+            if r.get("graph_path"):
+                entry.setdefault("metadata", {})["graph_path"] = r.get("graph_path")
+            if r.get("supporting_context"):
+                entry.setdefault("metadata", {})["supporting_context"] = r.get("supporting_context")
+            if r.get("supporting_graph_context"):
+                entry.setdefault("metadata", {})["supporting_graph_context"] = r.get("supporting_graph_context")
+            if query_debug and idx == 0:
+                entry.setdefault("metadata", {})["query_debug"] = query_debug
             if r.get("created_at"):
                 entry["created_at"] = r["created_at"]
+            for key in ("user_id", "agent_id", "run_id"):
+                if r.get(key):
+                    entry[key] = r[key]
             formatted.append(entry)
         formatted.sort(key=lambda x: x.get("score", 0), reverse=True)
+        if query_debug:
+            return {"results": formatted, "query_debug": query_debug}
         return formatted
 
     async def delete_user(self, user_id: str) -> bool:

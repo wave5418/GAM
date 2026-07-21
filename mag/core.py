@@ -425,6 +425,14 @@ def _mag_analyze_query(query: str) -> Dict[str, Any]:
     }
 
 
+def _mag_add_source(source: str, route: str) -> str:
+    """Append a route label once while preserving route order."""
+    parts = [part for part in str(source or "").split("+") if part]
+    if route not in parts:
+        parts.append(route)
+    return "+".join(parts)
+
+
 def _mag_candidate_evidence_features(
     query: str,
     candidate: Dict[str, Any],
@@ -3128,7 +3136,7 @@ class MAGMemory(MemoryBase):
                 route_scores["graph"] = max(route_scores.get("graph", 0), graph_scores.get("graph", 0))
                 route_scores["graph_path_len"] = graph_scores.get("path_len", 0)
                 route_scores["graph_reinforced"] = 1.0
-                merged_map[rid]["source"] += "+graph_bfs"
+                merged_map[rid]["source"] = _mag_add_source(merged_map[rid].get("source", ""), "graph_bfs")
                 merged_map[rid]["score"] = max(merged_map[rid]["score"], r["score"])
                 if r.get("supporting_graph_context"):
                     merged_map[rid]["supporting_graph_context"] = r["supporting_graph_context"]
@@ -3273,7 +3281,10 @@ class MAGMemory(MemoryBase):
                             if neighbor_payload is not None:
                                 merged_map[neighbor_id]["score"] = max(
                                     merged_map[neighbor_id]["score"], base_score)
-                                merged_map[neighbor_id]["source"] += "+ctx_boost"
+                                merged_map[neighbor_id]["source"] = _mag_add_source(
+                                    merged_map[neighbor_id].get("source", ""),
+                                    "ctx_boost",
+                                )
                             seen_ids.add(neighbor_id)
                             continue
                         if neighbor_id in seen_ids:
@@ -3334,6 +3345,17 @@ class MAGMemory(MemoryBase):
             route_composition[source] = route_composition.get(source, 0) + 1
         route_debug["route_composition"] = route_composition
 
+        for r in final:
+            metadata = r.setdefault("metadata", {})
+            if r.get("route_scores"):
+                metadata["route_scores"] = r["route_scores"]
+            if r.get("graph_path"):
+                metadata["graph_path"] = r["graph_path"]
+            if r.get("supporting_context"):
+                metadata["supporting_context"] = r["supporting_context"]
+            if r.get("supporting_graph_context"):
+                metadata["supporting_graph_context"] = r["supporting_graph_context"]
+
         return {"results": final, "context": "\n".join(ctx_lines), "debug": {
             "total": len(merged_list),
             "avg_r1": round(avg_score, 4),
@@ -3372,7 +3394,7 @@ class MAGMemory(MemoryBase):
                 ):
                     if sid in m:
                         m[sid]["score"] = 0.7 * m[sid]["mem0_score"] + 0.3 * bfs_s
-                        m[sid]["source"] += "+graph_bfs"
+                        m[sid]["source"] = _mag_add_source(m[sid].get("source", ""), "graph_bfs")
                     else:
                         p = {}; txt = ""; ts = ""
                         try:
