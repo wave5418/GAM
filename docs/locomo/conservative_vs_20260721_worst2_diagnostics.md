@@ -1,0 +1,160 @@
+# Conservative BFS vs 20260721 Worst-2 Diagnostics
+
+## Scope
+- Baseline: `results/locomo/locomo_results_20260716_175424.json`
+- New run: `/home/lhw/MAG/results/locomo/locomo_results_20260721_161128.json`
+- Conversations: `3,8`; cutoff: `top_10`; aligned questions: `355`
+
+## Outcome
+- Transitions: `{'both_correct': 278, 'lost_correct_to_wrong': 22, 'both_wrong': 40, 'gained_wrong_to_correct': 15}`
+- Primary issues: `{'stable': 278, 'retrieval_shift': 13, 'missing_or_buried_evidence': 6, 'judge_or_generation_variance': 37, 'fixed': 15, 'generation_abstention': 1, 'temporal_retrieval_shift': 2, 'bfs_noise_or_graph_reroute': 3}`
+- Net change: `22` regressions vs `15` fixes, so `-7` questions on this slice.
+
+## Regression Pattern
+- Most regressions are retrieval-set shifts, not identical evidence judged differently.
+- BFS-related regressions are visible but not the only class; temporal/list/open-domain intent ambiguity also appears.
+- Because the 20260721 run predates the new profiler, old/new timing fields are mostly unavailable in this diff; future runs will expose `query_debug.routes.timing_ms`.
+
+## Lost Correct→Wrong Cases
+- `conv3_q4` `open-domain` issue=`retrieval_shift` symptoms=`topk_changed` overlap=`0.25` old_gt=`0.3333` new_gt=`0.3333`
+  - Q: What pets wouldn't cause any discomfort to Joanna?
+  - old: Joanna has not identified any specific pets that wouldn't cause her discomfort, but she has expressed a desire for turtles, which may be a potential option if they do not trigger her allergies.
+  - new: Joanna has not identified any specific pets that wouldn't cause her discomfort due to her allergies.
+- `conv3_q34` `multi-hop` issue=`retrieval_shift` symptoms=`topk_changed,gt_support_dropped` overlap=`0.1111` old_gt=`0.4` new_gt=`0.0`
+  - Q: What book recommendations has Joanna given to Nate?
+  - old: Joanna recommended "Little Women" to Nate.
+  - new: Joanna has recommended "The Lord of the Rings" Trilogy to Nate, along with another unspecified book.
+- `conv3_q43` `temporal` issue=`generation_abstention` symptoms=`temporal_question,new_answer_abstained,old_answer_abstained` overlap=`0.5385` old_gt=`0.0` new_gt=`0.0`
+  - Q: How long did it take for Joanna to finish writing her book?
+  - old: The exact duration it took Joanna to finish writing her book is not specified. She completed it around the end of September 2022, but the start date is unknown.
+  - new: The memories do not specify how long it took Joanna to finish writing her book.
+- `conv3_q51` `multi-hop` issue=`retrieval_shift` symptoms=`topk_changed,new_answer_abstained,old_answer_abstained` overlap=`0.1765` old_gt=`0.5` new_gt=`0.5`
+  - Q: When did Nate get Tilly for Joanna?
+  - old: The memories do not specify when Nate got Tilly for Joanna.
+  - new: The memories do not specify when Nate got Tilly for Joanna.
+- `conv3_q54` `temporal` issue=`temporal_retrieval_shift` symptoms=`topk_changed,temporal_question` overlap=`0.25` old_gt=`0.6` new_gt=`0.6`
+  - Q: When was Joanna's second movie script shown on the big screens?
+  - old: October 23, 2022
+  - new: Joanna's second movie script was completed on March 18, 2022, but there is no record of it being shown on the big screen.
+- `conv3_q60` `open-domain` issue=`retrieval_shift` symptoms=`topk_changed,new_answer_abstained` overlap=`0.0526` old_gt=`0.7` new_gt=`0.6`
+  - Q: What Console does Nate own?
+  - old: Nintendo console.
+  - new: The specific console Nate owns is not mentioned in the memories.
+- `conv3_q79` `multi-hop` issue=`judge_or_generation_variance` symptoms=`` overlap=`0.4286` old_gt=`0.0` new_gt=`0.0`
+  - Q: How many screenplays has Joanna written?
+  - old: 3
+  - new: 2
+- `conv3_q84` `open-domain` issue=`retrieval_shift` symptoms=`topk_changed` overlap=`0.0` old_gt=`0.2857` new_gt=`0.1429`
+  - Q: Was the first half of September 2022 a good month career-wise for Nate and Joanna? Answer yes or no.
+  - old: no
+  - new: Yes
+- `conv3_q99` `single-hop` issue=`retrieval_shift` symptoms=`topk_changed` overlap=`0.3333` old_gt=`0.4444` new_gt=`0.5556`
+  - Q: What are Joanna's plans for her finished screenplay in January 2022?
+  - old: Joanna's plans for her finished screenplay in January 2022 included completing and printing it, preparing for submission or further development.
+  - new: Joanna's plans for her finished screenplay in January 2022 included completing and printing it on January 23, 2022.
+- `conv3_q126` `single-hop` issue=`retrieval_shift` symptoms=`topk_changed,new_answer_abstained` overlap=`0.3333` old_gt=`0.3333` new_gt=`0.3333`
+  - Q: What special items did Nate get for everyone at his gaming party?
+  - old: Nate got controller accessories for everyone at his gaming party.
+  - new: The memories do not specify any special items that Nate got for everyone at his gaming party.
+- `conv3_q127` `single-hop` issue=`retrieval_shift` symptoms=`topk_changed,new_answer_abstained` overlap=`0.1765` old_gt=`1.0` new_gt=`1.0`
+  - Q: What did Joanna write yesterday that appeared on the big screen?
+  - old: Joanna did not write anything that appeared on the big screen yesterday (November 8, 2022). The last confirmed instance was a movie script shown on October 23, 2022.
+  - new: The memories do not specify what Joanna wrote yesterday that appeared on the big screen.
+- `conv3_q141` `single-hop` issue=`retrieval_shift` symptoms=`topk_changed` overlap=`0.3333` old_gt=`0.0` new_gt=`0.0`
+  - Q: What did Nate do while Joanna was on her road trip?
+  - old: Nate was winning something while Joanna was on her road trip.
+  - new: Nate was likely taking time off to chill with his pets while Joanna was on her road trip.
+- `conv8_q4` `temporal` issue=`bfs_noise_or_graph_reroute` symptoms=`topk_changed,graph_ratio_increased,temporal_question,old_answer_abstained` overlap=`0.0` old_gt=`1.0` new_gt=`1.0`
+  - Q: Which hobby did Sam take up in May 2023?
+  - old: The memories do not specify which hobby Sam took up in May 2023, but Sam is actively engaged in painting and hiking.
+  - new: Sam took up exercising regularly at the gym in May 2023.
+- `conv8_q20` `open-domain` issue=`retrieval_shift` symptoms=`topk_changed` overlap=`0.1765` old_gt=`0.375` new_gt=`0.375`
+  - Q: In light of the health and dietary changes discussed, what would be an appropriate gift for both Evan and Sam to encourage their healthy lifestyles?
+  - old: An appropriate gift for both Evan and Sam to encourage their healthy lifestyles would be a subscription to a healthy meal kit service or a fitness tracker/smartwatch.
+  - new: Fitness trackers or smartwatches, healthy meal prep containers, and swimming gear.
+- `conv8_q25` `temporal` issue=`judge_or_generation_variance` symptoms=`temporal_question` overlap=`0.4286` old_gt=`0.0` new_gt=`0.0`
+  - Q: Which year did Evan start taking care of his health seriously?
+  - old: 2021
+  - new: 2022
+- `conv8_q37` `multi-hop` issue=`bfs_noise_or_graph_reroute` symptoms=`topk_changed,graph_ratio_increased` overlap=`0.1765` old_gt=`0.0714` new_gt=`0.2143`
+  - Q: What kind of healthy meals did Sam start eating after getting a health scare?
+  - old: Sam started eating healthy meals that are nutritious and beneficial for recovery, focusing on reducing soda and candy intake and seeking healthy recipes.
+  - new: Sam started eating a plate of vegetables and a glass of milk, as well as healthy cookies that are packed with nutrients.
+- `conv8_q43` `open-domain` issue=`retrieval_shift` symptoms=`topk_changed,gt_support_dropped,new_answer_abstained,old_answer_abstained` overlap=`0.0` old_gt=`0.3333` new_gt=`0.0`
+  - Q: How often does Sam get health checkups?
+  - old: Sam gets health check-ups, but the frequency is not specified in the memories. The most recent check-up was on a Monday before October 8, 2023.
+  - new: The memories do not specify how often Sam gets health checkups.
+- `conv8_q58` `temporal` issue=`temporal_retrieval_shift` symptoms=`topk_changed,temporal_question` overlap=`0.1765` old_gt=`0.0` new_gt=`0.0`
+  - Q: When did Evan start lifting weights?
+  - old: Evan started lifting weights on October 8, 2022.
+  - new: 11 January 2023
+- `conv8_q69` `multi-hop` issue=`bfs_noise_or_graph_reroute` symptoms=`topk_changed,gt_support_dropped,graph_ratio_increased` overlap=`0.0526` old_gt=`0.375` new_gt=`0.125`
+  - Q: Which two significant life events occur in Evan's life in December 2023 with his partner?
+  - old: Evan experienced love at first sight with his partner and received congratulations from Sam, indicating a significant relationship milestone, likely an engagement.
+  - new: No significant life events for Evan in December 2023 are mentioned in the memories.
+- `conv8_q103` `single-hop` issue=`retrieval_shift` symptoms=`topk_changed` overlap=`0.1111` old_gt=`1.0` new_gt=`1.0`
+  - Q: What kind of recipe did Evan request from Sam on 19 August, 2023?
+  - old: Evan requested healthy recipes from Sam, and Sam offered a roasted veg recipe.
+  - new: Evan requested the recipe for Sam's homemade sauce on August 19, 2023.
+- `conv8_q116` `single-hop` issue=`judge_or_generation_variance` symptoms=`` overlap=`0.5385` old_gt=`0.6667` new_gt=`0.6667`
+  - Q: What painting did Evan share with Sam in October?
+  - old: Evan shared a sunset painting inspired by a vacation a few years back and a cactus painting from a road trip last month.
+  - new: Evan shared a painting described as a "peaceful sunset" with Sam on October 14, 2023.
+- `conv8_q131` `single-hop` issue=`retrieval_shift` symptoms=`topk_changed` overlap=`0.25` old_gt=`1.0` new_gt=`1.0`
+  - Q: What did Sam suggest Evan try for stress relief and flexibility?
+  - old: Sam suggested Evan try yoga for stress relief and flexibility.
+  - new: Sam did not suggest anything specific to Evan for stress relief and flexibility.
+
+## Fixed Wrong→Correct Cases
+- `conv3_q26` `temporal` symptoms=`topk_changed,temporal_question,new_answer_abstained` overlap=`0.25`
+  - Q: When did Nate win his third tourney?
+  - new: The exact date of Nate's third tournament is not specified, but it occurred between May 2, 2022, and July 10, 2022.
+- `conv3_q29` `temporal` symptoms=`temporal_question` overlap=`0.4286`
+  - Q: When is Joanna going to make Nate's ice cream for her family?
+  - new: Joanna is going to make Nate's ice cream for her family on the weekend of June 24, 2022.
+- `conv3_q38` `temporal` symptoms=`topk_changed,temporal_question` overlap=`0.3333`
+  - Q: When did Joanna make a desert with almond milk?
+  - new: Joanna made a dessert with almond milk on September 14, 2022.
+- `conv3_q69` `multi-hop` symptoms=`` overlap=`0.6667`
+  - Q: How many turtles does Nate have?
+  - new: Nate has three turtles.
+- `conv3_q93` `single-hop` symptoms=`topk_changed,old_answer_abstained` overlap=`0.1765`
+  - Q: What game was the second tournament that Nate won based on?
+  - new: The second tournament that Nate won was based on **Street Fighter**.
+- `conv3_q94` `single-hop` symptoms=`topk_changed` overlap=`0.25`
+  - Q: What is Joanna's third screenplay about?
+  - new: Joanna's third screenplay is a love story with lots of challenges.
+- `conv3_q119` `single-hop` symptoms=`topk_changed,graph_ratio_increased,old_answer_abstained` overlap=`0.0`
+  - Q: What does Nate feel he could do when out in cool places like Whispering Falls?
+  - new: Nate feels he could appreciate the beauty around him and life's little joys when out in cool places like Whispering Falls.
+- `conv3_q122` `single-hop` symptoms=`topk_changed,gt_support_dropped` overlap=`0.25`
+  - Q: What did Nate do for Joanna on 25 May, 2022?
+  - new: Nate supported Joanna and expressed excitement about seeing her work on 25 May, 2022.
+- `conv8_q5` `open-domain` symptoms=`topk_changed,graph_ratio_increased,old_answer_abstained` overlap=`0.0`
+  - Q: Which country was Evan visiting in May 2023?
+  - new: Canada
+- `conv8_q39` `temporal` symptoms=`topk_changed,graph_ratio_increased,temporal_question` overlap=`0.0`
+  - Q: How many months lapsed between Sam's first and second doctor's appointment?
+  - new: 3 months
+- `conv8_q41` `temporal` symptoms=`topk_changed,temporal_question` overlap=`0.0`
+  - Q: Which classes did Evan join in mid-August 2023?
+  - new: Evan joined painting classes in mid-August 2023.
+- `conv8_q52` `temporal` symptoms=`topk_changed,temporal_question` overlap=`0.0526`
+  - Q: Which activity do Evan and Sam plan on doing together during September 2023?
+  - new: Evan and Sam plan on doing a painting session together during September 2023.
+- `conv8_q57` `open-domain` symptoms=`topk_changed,old_answer_abstained` overlap=`0.0`
+  - Q: Which US state was Sam travelling in during October 2023?
+  - new: California
+- `conv8_q74` `temporal` symptoms=`topk_changed,temporal_question` overlap=`0.0526`
+  - Q: When did Evan's son fall off his bike?
+  - new: December 12, 2023
+- `conv8_q77` `multi-hop` symptoms=`topk_changed` overlap=`0.0`
+  - Q: How does Evan spend his time with his bride after the wedding?
+  - new: Evan spends his time with his bride by enjoying each other's company, preparing for parenthood, and planning family events like a big family reunion.
+
+## Method Implications
+- Add query planning as observation first: answer shape, target entities, temporal constraints, list/count requirements.
+- Treat BFS as candidate evidence-chain generator; require sentence-level validator/time/entity checks before Top10 admission.
+- Keep sentence text as the authority; triples should index and connect sentences, not replace evidence.
+- Use the new MAG search profiler before optimizing latency; measure vector/BM25, BFS path search, payload materialization, rerank, and context window separately.
+- Move toward layered retrieval: session/date → entity/event → sentence → context window, with explicit gate rules between layers.
