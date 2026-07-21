@@ -279,6 +279,7 @@ async def ingest_conversation(
 
     sorted_sessions = get_sorted_sessions(conversation)
     total_chunks = sum(len(session_to_chunks(s, speaker_a, speaker_b)) for _, _, s in sorted_sessions)
+    ingest_started = time.monotonic()
 
     logger.info(
         "Ingesting conversation %d: %s & %s, %d sessions, %d chunks",
@@ -370,8 +371,12 @@ async def ingest_conversation(
             pbar.update(1)
 
     pbar.close()
+    ingestion_latency = (time.monotonic() - ingest_started) * 1000
     if debug_file:
-        debug_file.write(f"\nSUMMARY: {total_processed}/{total_chunks} OK, {total_failed} failed\n")
+        debug_file.write(
+            f"\nSUMMARY: {total_processed}/{total_chunks} OK, {total_failed} failed, "
+            f"{ingestion_latency:.1f} ms\n"
+        )
         debug_file.close()
 
     checkpoint.save_complete(key, {
@@ -381,7 +386,12 @@ async def ingest_conversation(
         "chunk_size": CHUNK_SIZE,
         "total_chunks_processed": total_processed,
         "total_chunks_failed": total_failed,
+        "ingestion_latency_ms": round(ingestion_latency, 1),
     })
+    logger.info(
+        "Conversation %d ingestion complete: %d/%d chunks OK, %d failed, %.1f ms",
+        conv_idx, total_processed, total_chunks, total_failed, ingestion_latency,
+    )
 
     return total_failed == 0, user_id, total_processed
 
@@ -519,7 +529,9 @@ async def process_question(
 
         # Generate answer
         gen_prompt = get_answer_generation_prompt(question, sliced, reference_date=reference_date_human, user_profile=user_profile)
+        generation_started = time.monotonic()
         generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generation_latency = (time.monotonic() - generation_started) * 1000
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
@@ -529,10 +541,12 @@ async def process_question(
         else:
             judge_prompt = get_judge_prompt(category, question, processed_answer, generated_answer)
 
+        judge_started = time.monotonic()
         raw = await judge_llm.generate_structured(
             system=JUDGE_SYSTEM_PROMPT,
             user=judge_prompt,
         )
+        judge_latency = (time.monotonic() - judge_started) * 1000
         if isinstance(raw, dict):
             label_val = raw.get("label", "").upper()
             correct = label_val == "CORRECT"
@@ -548,6 +562,9 @@ async def process_question(
             "generated_answer": generated_answer,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
+            "generation_latency_ms": round(generation_latency, 1),
+            "judge_latency_ms": round(judge_latency, 1),
+            "answer_and_judge_latency_ms": round(generation_latency + judge_latency, 1),
         }
 
     result["cutoff_results"] = cutoff_results
@@ -589,7 +606,9 @@ async def apply_locomo_judge_to_saved_result(
         gen_prompt = get_answer_generation_prompt(
             question, sliced, reference_date=reference_date_human, user_profile=user_profile,
         )
+        generation_started = time.monotonic()
         generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generation_latency = (time.monotonic() - generation_started) * 1000
         if "ANSWER:" in generated_answer:
             generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
 
@@ -600,10 +619,12 @@ async def apply_locomo_judge_to_saved_result(
         else:
             judge_prompt = get_judge_prompt(category, question, processed_answer, generated_answer)
 
+        judge_started = time.monotonic()
         raw = await judge_llm.generate_structured(
             system=JUDGE_SYSTEM_PROMPT,
             user=judge_prompt,
         )
+        judge_latency = (time.monotonic() - judge_started) * 1000
         if isinstance(raw, dict):
             label_val = raw.get("label", "").upper()
             correct = label_val == "CORRECT"
@@ -619,6 +640,9 @@ async def apply_locomo_judge_to_saved_result(
             "generated_answer": generated_answer,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
+            "generation_latency_ms": round(generation_latency, 1),
+            "judge_latency_ms": round(judge_latency, 1),
+            "answer_and_judge_latency_ms": round(generation_latency + judge_latency, 1),
         }
 
     result["cutoff_results"] = cutoff_results
