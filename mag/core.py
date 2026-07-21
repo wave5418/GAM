@@ -362,6 +362,89 @@ def _mag_text_tokens(text: Any) -> Set[str]:
     }
 
 
+def _mag_build_query_plan(query: str, query_entities: Optional[List[Tuple[str, str]]] = None) -> Dict[str, Any]:
+    """Build inspectable query intent metadata without changing retrieval."""
+    query_text = str(query or "")
+    query_lower = query_text.lower()
+    raw_tokens = re.findall(r"[a-z0-9]+", query_lower)
+    content_terms: List[str] = []
+    for token in raw_tokens:
+        if len(token) <= 2 or token in _MAG_EVIDENCE_STOPWORDS:
+            continue
+        if token not in content_terms:
+            content_terms.append(token)
+
+    target_entities: List[Dict[str, str]] = []
+    for entity in query_entities or []:
+        if not isinstance(entity, (list, tuple)) or len(entity) < 2:
+            continue
+        entity_type = str(entity[0] or "").strip()
+        entity_name = str(entity[1] or "").strip()
+        if entity_name:
+            target_entities.append({"type": entity_type, "name": entity_name})
+
+    temporal_terms = []
+    for match in _MAG_DATE_RE.finditer(query_text):
+        value = match.group(0).lower()
+        if value not in temporal_terms:
+            temporal_terms.append(value)
+
+    starts_yes_no = bool(re.match(r"\s*(did|does|do|is|are|was|were|has|have|had|can|could|will|would)\b", query_lower))
+    list_cue = bool(re.search(
+        r"\b(which two|what\b.{0,40}\b(?:kind|kinds|type|types|things|activities|items|books|meals|recipes|events|recommendations)|"
+        r"list|both|all|several|multiple)\b",
+        query_lower,
+    ))
+    temporal_cue = bool(temporal_terms or re.search(r"\b(when|what date|which month|which day|which year)\b", query_lower))
+
+    if re.search(r"\b(how many|number of|count|total)\b", query_lower):
+        answer_shape = "count"
+    elif starts_yes_no or re.search(r"\b(yes or no|whether)\b", query_lower):
+        answer_shape = "yes_no"
+    elif temporal_cue and re.search(r"\b(when|what date|which month|which day|which year)\b", query_lower):
+        answer_shape = "date"
+    elif list_cue:
+        answer_shape = "list"
+    elif re.search(r"\bwho\b", query_lower):
+        answer_shape = "person"
+    elif re.search(r"\bwhere\b", query_lower):
+        answer_shape = "location"
+    else:
+        answer_shape = "span"
+
+    relation_hints = []
+    hint_patterns = {
+        "recommendation": r"\b(recommend|suggest|book|books|recipe|recipes|meal|meals)\b",
+        "preference": r"\b(favorite|like|likes|liked|prefer|preference|hobby|interest)\b",
+        "event": r"\b(event|attend|visited|went|meeting|class|trip|concert|plan)\b",
+        "health": r"\b(health|healthy|workout|exercise|yoga|lifting|weight|weights)\b",
+        "ownership": r"\b(own|owns|owned|buy|bought|purchase|console)\b",
+    }
+    for label, pattern in hint_patterns.items():
+        if re.search(pattern, query_lower):
+            relation_hints.append(label)
+
+    if temporal_cue and answer_shape in {"count", "list"}:
+        evidence_mode = "temporal_aggregate"
+    elif temporal_cue and re.search(r"\b(before|after|last|next|during|in)\b", query_lower):
+        evidence_mode = "temporal_chain"
+    elif answer_shape in {"count", "list"}:
+        evidence_mode = "aggregate"
+    elif len(target_entities) >= 2 or "both" in raw_tokens:
+        evidence_mode = "multi_hop"
+    else:
+        evidence_mode = "single_sentence"
+
+    return {
+        "answer_shape": answer_shape,
+        "evidence_mode": evidence_mode,
+        "target_entities": target_entities[:8],
+        "time_constraints": temporal_terms[:8],
+        "relation_hints": relation_hints,
+        "must_have_terms": content_terms[:12],
+    }
+
+
 def _mag_jaccard(left: Set[str], right: Set[str]) -> float:
     if not left or not right:
         return 0.0
@@ -2892,6 +2975,7 @@ class MAGMemory(MemoryBase):
                 for word in ename.split():
                     if len(word) > 2:
                         qews.append(EntityWeight(name=word, attention_weight=0.4, entity_type="TOKEN"))
+        route_debug["query_plan"] = _mag_build_query_plan(query, query_entities)
         _mark_timing("entity_extract")
 
         # ── Primary validator route: vector+BM25 seeds the pool. BFS may

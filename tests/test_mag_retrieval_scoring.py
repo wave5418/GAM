@@ -1,5 +1,5 @@
 from benchmarks.common.mem0_client import format_search_results
-from mag.core import _mag_add_source, _mag_candidate_evidence_features, _mag_diverse_topk
+from mag.core import _mag_add_source, _mag_build_query_plan, _mag_candidate_evidence_features, _mag_diverse_topk
 
 
 def test_evidence_features_reward_query_and_temporal_coverage():
@@ -14,6 +14,31 @@ def test_evidence_features_reward_query_and_temporal_coverage():
     assert features["query_coverage"] > 0.5
     assert features["temporal_cue"] == 1.0
     assert features["evidence_score"] > 0.6
+
+
+def test_query_plan_marks_aggregate_temporal_and_entities():
+    plan = _mag_build_query_plan(
+        "What recipes did Caroline recommend in September?",
+        [("PERSON", "Caroline")],
+    )
+
+    assert plan["answer_shape"] == "list"
+    assert plan["evidence_mode"] == "temporal_aggregate"
+    assert plan["time_constraints"] == ["september"]
+    assert plan["target_entities"] == [{"type": "PERSON", "name": "Caroline"}]
+    assert "recommendation" in plan["relation_hints"]
+    assert "recipes" in plan["must_have_terms"]
+
+
+def test_query_plan_marks_indirect_recommendation_lists():
+    plan = _mag_build_query_plan(
+        "What book recommendations has Joanna given to Nate?",
+        [("PROPER", "Joanna"), ("PROPER", "Nate")],
+    )
+
+    assert plan["answer_shape"] == "list"
+    assert plan["evidence_mode"] == "aggregate"
+    assert "recommendation" in plan["relation_hints"]
 
 
 def test_diverse_topk_keeps_high_score_but_reduces_duplicate_cluster():
