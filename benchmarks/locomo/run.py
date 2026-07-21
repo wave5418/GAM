@@ -653,6 +653,7 @@ def expected_locomo_question_items(
     conv_indices: list[int],
     categories: list[int],
     max_questions: int | None,
+    question_ids: set[str] | None = None,
 ) -> list[tuple[str, int, int, dict]]:
     """(question_id, conv_idx, qa_idx, qa_dict) for every question in scope."""
     items: list[tuple[str, int, int, dict]] = []
@@ -668,8 +669,22 @@ def expected_locomo_question_items(
         if max_questions is not None:
             conv_questions = conv_questions[:max_questions]
         for qi, qa in conv_questions:
-            items.append((f"conv{conv_idx}_q{qi}", conv_idx, qi, qa))
+            qid = f"conv{conv_idx}_q{qi}"
+            if question_ids is not None and qid not in question_ids:
+                continue
+            items.append((qid, conv_idx, qi, qa))
     return items
+
+
+def parse_question_ids(value: str | None) -> set[str] | None:
+    """Parse comma-separated LOCOMO question IDs such as conv3_q34."""
+    if not value or not value.strip():
+        return None
+    question_ids = {part.strip() for part in value.split(",") if part.strip()}
+    invalid = sorted(qid for qid in question_ids if not re.fullmatch(r"conv\d+_q\d+", qid))
+    if invalid:
+        raise ValueError(f"Invalid --question-ids values: {invalid}")
+    return question_ids
 
 
 def locomo_predict_outputs_complete(
@@ -790,6 +805,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with-evidence", action="store_true", help="Pass evidence to judge")
     parser.add_argument("--user-profile", action="store_true", help="Fetch user profiles")
     parser.add_argument("--max-questions", type=int, default=None, help="Max questions to process (for quick testing)")
+    parser.add_argument(
+        "--question-ids",
+        default=None,
+        help="Comma-separated question IDs to process, e.g. conv3_q34,conv8_q69",
+    )
     parser.add_argument("--rpm", type=int, default=200, help="Requests per minute for LLM")
     parser.add_argument("--backend", default="oss", choices=["oss", "cloud", "mag", "local"],
                         help="Memory backend: oss/cloud/mag/local")
@@ -814,6 +834,7 @@ async def async_main() -> None:
     cutoffs = parse_cutoffs(args.top_k_cutoffs)
     categories = [int(c) for c in args.categories.split(",")]
     conv_indices = [int(c) for c in args.conversations.split(",")]
+    question_ids = parse_question_ids(args.question_ids)
 
     run_id = args.run_id or uuid.uuid4().hex[:8]
     output_dir = os.path.join(args.output_dir, f"predicted_{args.project_name}")
@@ -848,7 +869,7 @@ async def async_main() -> None:
 
     if args.evaluate_only:
         expected_items = expected_locomo_question_items(
-            dataset, conv_indices, categories, args.max_questions,
+            dataset, conv_indices, categories, args.max_questions, question_ids,
         )
         if not expected_items:
             print("No questions in scope (check --conversations / --categories).")
@@ -906,6 +927,7 @@ async def async_main() -> None:
                 "top_k_cutoffs": [cutoff_label(c) for c in cutoffs],
                 "total_questions": len(all_evaluations),
                 "categories": categories,
+                "question_ids": sorted(question_ids) if question_ids else None,
                 "evaluate_only": True,
             },
             "metrics_by_cutoff": metrics,
@@ -995,6 +1017,11 @@ async def async_main() -> None:
             ]
             if args.max_questions is not None:
                 conv_questions = conv_questions[:args.max_questions]
+            if question_ids is not None:
+                conv_questions = [
+                    (qi, qa) for qi, qa in conv_questions
+                    if f"conv{conv_idx}_q{qi}" in question_ids
+                ]
 
             search_pbar = tqdm(conv_questions, desc=f"Questions conv {conv_idx}", leave=True)
             for qi, qa in search_pbar:
@@ -1060,8 +1087,9 @@ async def async_main() -> None:
                     "top_k": args.top_k,
                     "top_k_cutoffs": [cutoff_label(c) for c in cutoffs],
                     "total_questions": len(all_evaluations),
-                    "categories": categories,
-                },
+                "categories": categories,
+                "question_ids": sorted(question_ids) if question_ids else None,
+            },
                 "metrics_by_cutoff": metrics,
                 "evaluations": all_evaluations,
             })
