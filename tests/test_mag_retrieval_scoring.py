@@ -1,5 +1,11 @@
 from benchmarks.common.mem0_client import format_search_results
-from mag.core import _mag_add_source, _mag_build_query_plan, _mag_candidate_evidence_features, _mag_diverse_topk
+from mag.core import (
+    _mag_add_source,
+    _mag_bfs_shadow_gate,
+    _mag_build_query_plan,
+    _mag_candidate_evidence_features,
+    _mag_diverse_topk,
+)
 
 
 def test_evidence_features_reward_query_and_temporal_coverage():
@@ -39,6 +45,43 @@ def test_query_plan_marks_indirect_recommendation_lists():
     assert plan["answer_shape"] == "list"
     assert plan["evidence_mode"] == "aggregate"
     assert "recommendation" in plan["relation_hints"]
+
+
+def test_bfs_shadow_gate_flags_unsupported_graph_only_candidate():
+    query = "What book recommendations has Joanna given to Nate?"
+    plan = _mag_build_query_plan(query, [("PROPER", "Joanna"), ("PROPER", "Nate")])
+    gate = _mag_bfs_shadow_gate(
+        query,
+        plan,
+        {
+            "memory": "A weather forecast mentioned storms near Chicago.",
+            "entities": [{"name": "Chicago"}],
+            "route_scores": {"path_len": 2},
+        },
+        validator_backed=False,
+    )
+
+    assert gate["would_block"] is True
+    assert "missing_target_entity" in gate["reasons"]
+    assert "low_query_coverage" in gate["reasons"]
+
+
+def test_bfs_shadow_gate_never_blocks_validator_backed_candidate():
+    query = "When did Evan start lifting weights?"
+    plan = _mag_build_query_plan(query, [("PROPER", "Evan")])
+    gate = _mag_bfs_shadow_gate(
+        query,
+        plan,
+        {
+            "memory": "Evan started lifting weights in June 2023.",
+            "entities": [{"name": "Evan"}],
+            "route_scores": {"path_len": 3},
+        },
+        validator_backed=True,
+    )
+
+    assert gate["would_block"] is False
+    assert gate["reasons"] == ["validator_backed"]
 
 
 def test_diverse_topk_keeps_high_score_but_reduces_duplicate_cluster():

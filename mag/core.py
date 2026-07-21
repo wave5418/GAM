@@ -445,6 +445,89 @@ def _mag_build_query_plan(query: str, query_entities: Optional[List[Tuple[str, s
     }
 
 
+def _mag_entity_texts(entities: Any) -> Set[str]:
+    names: Set[str] = set()
+    if not isinstance(entities, list):
+        return names
+    for entity in entities:
+        if isinstance(entity, dict):
+            value = entity.get("name", "")
+        elif isinstance(entity, (list, tuple)) and entity:
+            value = entity[-1]
+        else:
+            value = entity
+        value = str(value or "").strip().lower()
+        if value:
+            names.add(value)
+    return names
+
+
+def _mag_bfs_shadow_gate(
+    query: str,
+    query_plan: Dict[str, Any],
+    candidate: Dict[str, Any],
+    *,
+    validator_backed: bool,
+) -> Dict[str, Any]:
+    """Estimate whether a future BFS gate would admit a candidate; no enforcement."""
+    memory = str(candidate.get("memory", "") or "")
+    memory_lower = memory.lower()
+    created_at = str(candidate.get("created_at", "") or "").lower()
+    candidate_tokens = _mag_text_tokens(memory)
+    query_tokens = _mag_text_tokens(query)
+    coverage = len(query_tokens & candidate_tokens) / max(1, len(query_tokens))
+
+    candidate_entity_names = _mag_entity_texts(candidate.get("entities", []))
+    target_entities = query_plan.get("target_entities", []) if isinstance(query_plan, dict) else []
+    target_hits = 0
+    checked_targets = 0
+    for entity in target_entities:
+        name = str(entity.get("name", "") if isinstance(entity, dict) else entity).strip().lower()
+        if not name or name in _MAG_TEMPORAL_TERMS:
+            continue
+        checked_targets += 1
+        name_tokens = _mag_text_tokens(name)
+        name_hit = name in memory_lower or name in candidate_entity_names
+        token_hit = bool(name_tokens and name_tokens <= candidate_tokens)
+        if name_hit or token_hit:
+            target_hits += 1
+
+    time_constraints = query_plan.get("time_constraints", []) if isinstance(query_plan, dict) else []
+    time_compatible = True
+    if time_constraints:
+        haystack = f"{memory_lower} {created_at}"
+        time_compatible = all(str(term).lower() in haystack for term in time_constraints)
+
+    route_scores = candidate.get("route_scores", {}) if isinstance(candidate.get("route_scores"), dict) else {}
+    path_len = int(route_scores.get("path_len", 0) or 0)
+    evidence_mode = query_plan.get("evidence_mode", "") if isinstance(query_plan, dict) else ""
+
+    reasons: List[str] = []
+    if validator_backed:
+        reasons.append("validator_backed")
+    else:
+        if checked_targets and target_hits == 0:
+            reasons.append("missing_target_entity")
+        if coverage < 0.12:
+            reasons.append("low_query_coverage")
+        if not time_compatible:
+            reasons.append("time_mismatch")
+        if path_len > 2 and evidence_mode == "single_sentence":
+            reasons.append("long_path_for_single_sentence_query")
+
+    would_block = not validator_backed and bool(reasons)
+    return {
+        "validator_backed": validator_backed,
+        "would_block": would_block,
+        "reasons": reasons,
+        "query_coverage": round(coverage, 4),
+        "target_entity_hits": target_hits,
+        "target_entity_total": checked_targets,
+        "time_compatible": time_compatible,
+        "path_len": path_len,
+    }
+
+
 def _mag_jaccard(left: Set[str], right: Set[str]) -> float:
     if not left or not right:
         return 0.0
@@ -2959,6 +3042,14 @@ class MAGMemory(MemoryBase):
             "context_support_attached": 0,
             "evidence_quality_adjusted": 0,
             "diversity_pool_size": 0,
+            "bfs_shadow_gate": {
+                "evaluated": 0,
+                "would_pass": 0,
+                "would_block": 0,
+                "graph_only": 0,
+                "validator_backed": 0,
+                "block_reasons": {},
+            },
             "timing_ms": timing_ms,
         }
 
@@ -3111,7 +3202,7 @@ class MAGMemory(MemoryBase):
                         graph_memory += "\n[triples: " + "; ".join(triple_strs) + "]"
                     memory = validator.get("memory", "") if validator else graph_memory
 
-                    graph_list.append({
+                    graph_candidate = {
                         "id": candidate_id,
                         "memory": memory,
                         "score": final_score,
@@ -3125,7 +3216,23 @@ class MAGMemory(MemoryBase):
                             "path_len": path_len,
                         },
                         "graph_path": path_info.get("path", []),
-                    })
+                    }
+                    gate = _mag_bfs_shadow_gate(
+                        query,
+                        route_debug["query_plan"],
+                        graph_candidate,
+                        validator_backed=bool(validator),
+                    )
+                    graph_candidate["bfs_shadow_gate"] = gate
+                    gate_debug = route_debug["bfs_shadow_gate"]
+                    gate_debug["evaluated"] += 1
+                    gate_debug["validator_backed" if validator else "graph_only"] += 1
+                    gate_debug["would_block" if gate["would_block"] else "would_pass"] += 1
+                    for reason in gate["reasons"]:
+                        if reason == "validator_backed":
+                            continue
+                        gate_debug["block_reasons"][reason] = gate_debug["block_reasons"].get(reason, 0) + 1
+                    graph_list.append(graph_candidate)
                     if validator:
                         graph_list[-1]["supporting_graph_context"] = graph_memory
                 _mark_timing("graph_materialize")
@@ -3171,6 +3278,8 @@ class MAGMemory(MemoryBase):
                 route_scores["graph_reinforced"] = 1.0
                 merged_map[rid]["source"] = _mag_add_source(merged_map[rid].get("source", ""), "graph_bfs")
                 merged_map[rid]["score"] = max(merged_map[rid]["score"], r["score"])
+                if r.get("bfs_shadow_gate"):
+                    merged_map[rid]["bfs_shadow_gate"] = r["bfs_shadow_gate"]
                 if r.get("supporting_graph_context"):
                     merged_map[rid]["supporting_graph_context"] = r["supporting_graph_context"]
             else:
@@ -3391,6 +3500,8 @@ class MAGMemory(MemoryBase):
                 metadata["supporting_context"] = r["supporting_context"]
             if r.get("supporting_graph_context"):
                 metadata["supporting_graph_context"] = r["supporting_graph_context"]
+            if r.get("bfs_shadow_gate"):
+                metadata["bfs_shadow_gate"] = r["bfs_shadow_gate"]
 
         _mark_timing("metadata_attach")
         timing_ms["total"] = round((time.perf_counter() - search_started) * 1000, 1)
