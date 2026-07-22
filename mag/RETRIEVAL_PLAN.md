@@ -21,6 +21,10 @@ primary recall path, while vector/BM25/rerank validate and order graph evidence.
   candidates), uses vector/BM25 as validator scores, records per-candidate
   `route_scores`, and only adds vector-only memories as fallback when the graph
   pool is too small.
+- Graph construction now adds generic cross-sentence entity bridges inside a
+  small same-session window. Each bridge points to the opposite sentence as
+  evidence and carries a sentence-derived relation hint, so graph traversal can
+  recover dispersed list/aggregate facts without dataset-specific rules.
 
 ## Remaining Design Work
 
@@ -33,6 +37,8 @@ primary recall path, while vector/BM25/rerank validate and order graph evidence.
      entity coverage, temporal compatibility, and source-session diversity.
    - Prevent relation-only or hub-entity paths from dominating without sentence
      evidence.
+   - Treat `contextual_bridge:*` edges as recall edges: useful for candidate
+     discovery, but lower confidence than explicit extracted relations.
 
 3. Change context-window behavior.
    - Attach previous/next sentences to the owning candidate as supporting text.

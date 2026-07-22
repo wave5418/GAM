@@ -39,3 +39,28 @@ def test_bfs_search_stays_inside_requested_session_scope():
     assert "s_alice_a" in result_ids
     assert "s_bob_a" in result_ids
     assert "s_carol_b" not in result_ids
+
+
+def test_contextual_bridge_edge_recovers_other_sentence_in_scope():
+    graph = GraphStore()
+
+    graph.upsert_entity("Alice", 0.8, "s1", "PERSON", session_scope="user_id=a")
+    graph.upsert_entity("piano", 0.7, "s2", "OBJECT", session_scope="user_id=a")
+    graph.add_relation(
+        "Alice",
+        "contextual_bridge:plays_piano",
+        "piano",
+        "s2",
+        confidence=0.35,
+        session_scope="user_id=a",
+    )
+
+    bfs = BFSRetriever(graph)
+    results = bfs.search(
+        [EntityWeight(name="alice", attention_weight=1.0, entity_type="PERSON")],
+        max_hops=1,
+        max_results=10,
+        session_scope="user_id=a",
+    )
+
+    assert "s2" in {sid for sid, _ in results}

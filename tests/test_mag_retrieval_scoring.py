@@ -5,6 +5,7 @@ from mag.core import (
     _mag_build_query_plan,
     _mag_candidate_evidence_features,
     _mag_diverse_topk,
+    _mag_entity_bridge_relation,
     _mag_time_constraints_match,
 )
 
@@ -106,6 +107,17 @@ def test_diverse_topk_keeps_high_score_but_reduces_duplicate_cluster():
 def test_add_source_deduplicates_route_labels():
     assert _mag_add_source("vector+bm25_validator+graph_bfs", "graph_bfs") == "vector+bm25_validator+graph_bfs"
     assert _mag_add_source("vector+bm25_validator", "ctx_boost") == "vector+bm25_validator+ctx_boost"
+
+
+def test_entity_bridge_relation_uses_sentence_terms_not_entity_names():
+    relation = _mag_entity_bridge_relation(
+        "Alice started painting landscapes after the workshop.",
+        {"alice", "workshop"},
+    )
+
+    assert relation.startswith("contextual_bridge:")
+    assert "painting" in relation
+    assert "alice" not in relation
 
 
 def test_format_search_results_preserves_mag_metadata():

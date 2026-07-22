@@ -123,6 +123,12 @@ class MAGConfig:
     # 上下文窗口 — 检索时每个候选句附带前后各一句
     use_context_window: bool = False
 
+    # 跨句实体桥接 — 同一会话相邻句中的实体互连，边指向对端证据句。
+    # 这是通用图索引能力，用于补足纯单句三元组无法覆盖的列表/聚合事实。
+    use_entity_bridges: bool = True
+    entity_bridge_window: int = 2
+    entity_bridge_max_entities_per_sentence: int = 6
+
     # BM25 权重 — 降低到 < 1.0 可减少短句噪声
     bm25_weight: float = 1.0
 
@@ -211,6 +217,9 @@ class MAGConfig:
             use_history=_bool("USE_HISTORY", True),
             use_dedup=_bool("USE_DEDUP", True),
             use_context_window=_bool("USE_CONTEXT_WINDOW", False),
+            use_entity_bridges=_bool("USE_ENTITY_BRIDGES", True),
+            entity_bridge_window=_int("ENTITY_BRIDGE_WINDOW", 2),
+            entity_bridge_max_entities_per_sentence=_int("ENTITY_BRIDGE_MAX_ENTITIES", 6),
             bm25_weight=_float("BM25_WEIGHT", 1.0),
             filter_short=_bool("FILTER_SHORT", False),
             merge_short=_bool("MERGE_SHORT", False),
@@ -297,6 +306,9 @@ class MAGConfig:
             "use_history": self.use_history,
             "use_dedup": self.use_dedup,
             "use_context_window": self.use_context_window,
+            "use_entity_bridges": self.use_entity_bridges,
+            "entity_bridge_window": self.entity_bridge_window,
+            "entity_bridge_max_entities_per_sentence": self.entity_bridge_max_entities_per_sentence,
             "bm25_weight": self.bm25_weight,
             "filter_short": self.filter_short,
             "merge_short": self.merge_short,
@@ -334,4 +346,6 @@ class MAGConfig:
             "filter_short": self.filter_short,
             "coref_replace": self.coref_replace,
             "coref_mode": self.coref_mode,
+            "entity_bridges": self.use_entity_bridges,
+            "entity_bridge_window": self.entity_bridge_window,
         }

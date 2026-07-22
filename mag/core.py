@@ -588,6 +588,25 @@ def _mag_add_source(source: str, route: str) -> str:
     return "+".join(parts)
 
 
+def _mag_entity_bridge_relation(text: str, entity_names: Set[str], max_terms: int = 4) -> str:
+    """Build a generic relation hint for cross-sentence entity bridge edges."""
+    entity_tokens = set()
+    for name in entity_names:
+        entity_tokens.update(re.findall(r"[a-z0-9]+", str(name).lower()))
+
+    terms: List[str] = []
+    for token in re.findall(r"[a-z0-9]+", str(text).lower()):
+        if len(token) <= 2 or token in _MAG_EVIDENCE_STOPWORDS or token in entity_tokens:
+            continue
+        if token not in terms:
+            terms.append(token)
+        if len(terms) >= max_terms:
+            break
+    if not terms:
+        return "contextual_bridge"
+    return "contextual_bridge:" + "_".join(terms)
+
+
 def _mag_candidate_evidence_features(query: str, candidate: Dict[str, Any]) -> Dict[str, float]:
     """Compute small, inspectable retrieval-time evidence features."""
     memory = candidate.get("memory", "")
@@ -803,6 +822,9 @@ class MAGMemory(MemoryBase):
         self.mag_use_entity_boost = linear_rag_config is not None and linear_rag_config.get("use_entity_boost", False) if linear_rag_config else False
         self.mag_use_entity_match = linear_rag_config.get("use_entity_match", False) if linear_rag_config else False
         self.mag_use_context_window = linear_rag_config.get("use_context_window", False) if linear_rag_config else False
+        self.mag_use_entity_bridges = linear_rag_config.get("use_entity_bridges", True) if linear_rag_config else True
+        self.mag_entity_bridge_window = linear_rag_config.get("entity_bridge_window", 2) if linear_rag_config else 2
+        self.mag_entity_bridge_max_entities = linear_rag_config.get("entity_bridge_max_entities_per_sentence", 6) if linear_rag_config else 6
         self.mag_bm25_weight = linear_rag_config.get("bm25_weight", 1.0) if linear_rag_config else 1.0
         self.mag_filter_short = linear_rag_config.get("filter_short", False) if linear_rag_config else False
         self.mag_merge_short = linear_rag_config.get("merge_short", False) if linear_rag_config else False
@@ -2615,6 +2637,22 @@ class MAGMemory(MemoryBase):
 
         # ── S6: 实体节点立即写入图 ──
         for i, sid in enumerate(sentence_ids):
+            speaker_name = str(sentences[filtered_idx[i]][1] if i < len(filtered_idx) else "").strip()
+            if (
+                speaker_name
+                and speaker_name.lower() not in {"user", "assistant", "system"}
+                and len(speaker_name) > 1
+            ):
+                try:
+                    self.graph_store.upsert_entity(
+                        speaker_name,
+                        0.8,
+                        sid,
+                        "PERSON",
+                        session_scope=session_scope,
+                    )
+                except Exception:
+                    pass
             for ew in filtered_ew[i]:
                 try:
                     self.graph_store.upsert_entity(
@@ -2627,11 +2665,32 @@ class MAGMemory(MemoryBase):
                 except Exception:
                     pass
 
+        bridge_edges = 0
+        if sentence_ids:
+            try:
+                bridge_texts = [sentence_texts[idx] for idx in filtered_idx]
+                bridge_speakers = [sentences[idx][1] for idx in filtered_idx]
+                bridge_edges = self._mag_add_entity_context_bridges(
+                    sentence_ids,
+                    bridge_texts,
+                    filtered_ew,
+                    bridge_speakers,
+                    session_scope,
+                )
+            except Exception as e:
+                logger.debug("MAG entity context bridges: %s", str(e)[:100])
+
         # S5+S6 完后保存图到磁盘
         self._graph_save()
 
         gs = self.graph_store.stats()
-        logger.info("MAG: %d sentences → graph(entities=%d, edges=%d)", len(sentence_texts), gs["num_entities"], gs["num_relations"])
+        logger.info(
+            "MAG: %d sentences → graph(entities=%d, edges=%d, bridges=%d)",
+            len(sentence_texts),
+            gs["num_entities"],
+            gs["num_relations"],
+            bridge_edges,
+        )
         return [{"id": sid, "memory": sentence_texts[filtered_idx[i]], "event": "ADD",
                  "entities": [e.to_dict() for e in filtered_ew[i]], "speaker": sentences[filtered_idx[i]][1],
                  "created_at": sentences[filtered_idx[i]][2].isoformat()} for i, sid in enumerate(sentence_ids)]
@@ -2923,6 +2982,109 @@ class MAGMemory(MemoryBase):
     def flush_edge_sentences(self):
         """公开接口：强制 flush 积累的边候选句（session 边界等场景调用）。"""
         self._flush_edge_sentences()
+
+    def _mag_bridge_entities_for_sentence(
+        self,
+        entities: List[EntityWeight],
+        speaker: str = "",
+    ) -> List[Tuple[str, str, float]]:
+        """Return bounded, normalized entities used for cross-sentence bridges."""
+        candidates: Dict[str, Tuple[str, str, float]] = {}
+        for entity in entities or []:
+            name = str(getattr(entity, "name", "") or "").strip().lower()
+            if not name:
+                continue
+            weight = float(getattr(entity, "attention_weight", 0.5) or 0.5)
+            entity_type = str(getattr(entity, "entity_type", "") or "")
+            existing = candidates.get(name)
+            if existing is None or weight > existing[2]:
+                candidates[name] = (name, entity_type, weight)
+
+        speaker_name = str(speaker or "").strip().lower()
+        if (
+            speaker_name
+            and speaker_name not in {"user", "assistant", "system"}
+            and len(speaker_name) > 1
+        ):
+            existing = candidates.get(speaker_name)
+            if existing is None or existing[2] < 0.8:
+                candidates[speaker_name] = (speaker_name, "PERSON", 0.8)
+
+        ranked = sorted(candidates.values(), key=lambda item: item[2], reverse=True)
+        return ranked[: max(1, int(self.mag_entity_bridge_max_entities))]
+
+    def _mag_add_entity_context_bridges(
+        self,
+        sentence_ids: List[str],
+        sentence_texts: List[str],
+        entity_lists: List[List[EntityWeight]],
+        speakers: List[str],
+        session_scope: Optional[str],
+    ) -> int:
+        """Connect entities from nearby sentences so graph traversal can aggregate facts.
+
+        The bridge is generic and dataset-agnostic: for two nearby sentences in
+        the same session, entities in sentence A get low-confidence directed
+        edges to entities in sentence B, and each edge points to the opposite
+        sentence as evidence. This lets BFS recover the sentence that contains
+        the missing list item/fact without fabricating a summary node.
+        """
+        if not self.mag_use_entity_bridges or len(sentence_ids) < 2:
+            return 0
+
+        window = max(1, int(self.mag_entity_bridge_window or 1))
+        added = 0
+        entity_rows = [
+            self._mag_bridge_entities_for_sentence(entity_lists[i], speakers[i] if i < len(speakers) else "")
+            for i in range(len(sentence_ids))
+        ]
+
+        for i, left_entities in enumerate(entity_rows):
+            if not left_entities:
+                continue
+            for j in range(i + 1, min(len(sentence_ids), i + window + 1)):
+                right_entities = entity_rows[j]
+                if not right_entities:
+                    continue
+                distance = j - i
+                confidence = max(0.15, 0.35 / distance)
+                pair_count = 0
+                max_pairs = max(1, int(self.mag_entity_bridge_max_entities) ** 2)
+                for left_name, _, _ in left_entities:
+                    for right_name, _, _ in right_entities:
+                        if left_name == right_name:
+                            continue
+                        relation_right = _mag_entity_bridge_relation(
+                            sentence_texts[j] if j < len(sentence_texts) else "",
+                            {left_name, right_name},
+                        )
+                        relation_left = _mag_entity_bridge_relation(
+                            sentence_texts[i] if i < len(sentence_texts) else "",
+                            {left_name, right_name},
+                        )
+                        self.graph_store.add_relation(
+                            left_name,
+                            relation_right,
+                            right_name,
+                            sentence_ids[j],
+                            confidence,
+                            session_scope=session_scope,
+                        )
+                        self.graph_store.add_relation(
+                            right_name,
+                            relation_left,
+                            left_name,
+                            sentence_ids[i],
+                            confidence,
+                            session_scope=session_scope,
+                        )
+                        added += 2
+                        pair_count += 1
+                        if pair_count >= max_pairs:
+                            break
+                    if pair_count >= max_pairs:
+                        break
+        return added
 
     def _mag_session_scope_for_sentence(
         self,
