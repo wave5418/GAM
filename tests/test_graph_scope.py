@@ -41,19 +41,15 @@ def test_bfs_search_stays_inside_requested_session_scope():
     assert "s_carol_b" not in result_ids
 
 
-def test_contextual_bridge_edge_recovers_other_sentence_in_scope():
+def test_bfs_search_uses_multiple_edges_between_same_nodes():
     graph = GraphStore()
 
     graph.upsert_entity("Alice", 0.8, "s1", "PERSON", session_scope="user_id=a")
+    graph.upsert_entity("piano", 0.7, "s1", "OBJECT", session_scope="user_id=a")
+    graph.upsert_entity("Alice", 0.8, "s2", "PERSON", session_scope="user_id=a")
     graph.upsert_entity("piano", 0.7, "s2", "OBJECT", session_scope="user_id=a")
-    graph.add_relation(
-        "Alice",
-        "contextual_bridge:plays_piano",
-        "piano",
-        "s2",
-        confidence=0.35,
-        session_scope="user_id=a",
-    )
+    graph.add_relation("Alice", "plays", "piano", "s1", confidence=0.9, session_scope="user_id=a")
+    graph.add_relation("Alice", "bought", "piano", "s2", confidence=0.9, session_scope="user_id=a")
 
     bfs = BFSRetriever(graph)
     results = bfs.search(
@@ -63,4 +59,24 @@ def test_contextual_bridge_edge_recovers_other_sentence_in_scope():
         session_scope="user_id=a",
     )
 
-    assert "s2" in {sid for sid, _ in results}
+    assert {"s1", "s2"} <= {sid for sid, _ in results}
+
+
+def test_path_search_reads_reverse_multiedges_with_distinct_sources():
+    graph = GraphStore()
+
+    graph.add_relation("Alice", "plays", "piano", "s1", confidence=0.9, session_scope="user_id=a")
+    graph.add_relation("Alice", "bought", "piano", "s2", confidence=0.9, session_scope="user_id=a")
+
+    bfs = BFSRetriever(graph)
+    paths = bfs.search_paths(
+        [EntityWeight(name="piano", attention_weight=1.0, entity_type="OBJECT")],
+        query_embedding=None,
+        get_semantic_sim=lambda _: 1.0,
+        max_hops=1,
+        max_results=10,
+        session_scope="user_id=a",
+    )
+
+    source_ids = {sid for path in paths for sid in path["sentences"]}
+    assert {"s1", "s2"} <= source_ids

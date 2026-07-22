@@ -21,10 +21,10 @@ primary recall path, while vector/BM25/rerank validate and order graph evidence.
   candidates), uses vector/BM25 as validator scores, records per-candidate
   `route_scores`, and only adds vector-only memories as fallback when the graph
   pool is too small.
-- Graph construction now adds generic cross-sentence entity bridges inside a
-  small same-session window. Each bridge points to the opposite sentence as
-  evidence and carries a sentence-derived relation hint, so graph traversal can
-  recover dispersed list/aggregate facts without dataset-specific rules.
+- Graph construction now uses LLM direct triple extraction: the LLM reads a
+  batch of sentence ids and texts, then emits `(head, relation, tail,
+  source_sentence_id)` records. Graph nodes and edges are derived from those
+  triples rather than spaCy entity extraction plus pairwise relation judging.
 
 ## Remaining Design Work
 
@@ -37,8 +37,8 @@ primary recall path, while vector/BM25/rerank validate and order graph evidence.
      entity coverage, temporal compatibility, and source-session diversity.
    - Prevent relation-only or hub-entity paths from dominating without sentence
      evidence.
-   - Treat `contextual_bridge:*` edges as recall edges: useful for candidate
-     discovery, but lower confidence than explicit extracted relations.
+   - Preserve and score multiple edges between the same two nodes, because
+     different relations and source sentences can provide different evidence.
 
 3. Change context-window behavior.
    - Attach previous/next sentences to the owning candidate as supporting text.

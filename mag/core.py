@@ -588,25 +588,6 @@ def _mag_add_source(source: str, route: str) -> str:
     return "+".join(parts)
 
 
-def _mag_entity_bridge_relation(text: str, entity_names: Set[str], max_terms: int = 4) -> str:
-    """Build a generic relation hint for cross-sentence entity bridge edges."""
-    entity_tokens = set()
-    for name in entity_names:
-        entity_tokens.update(re.findall(r"[a-z0-9]+", str(name).lower()))
-
-    terms: List[str] = []
-    for token in re.findall(r"[a-z0-9]+", str(text).lower()):
-        if len(token) <= 2 or token in _MAG_EVIDENCE_STOPWORDS or token in entity_tokens:
-            continue
-        if token not in terms:
-            terms.append(token)
-        if len(terms) >= max_terms:
-            break
-    if not terms:
-        return "contextual_bridge"
-    return "contextual_bridge:" + "_".join(terms)
-
-
 def _mag_candidate_evidence_features(query: str, candidate: Dict[str, Any]) -> Dict[str, float]:
     """Compute small, inspectable retrieval-time evidence features."""
     memory = candidate.get("memory", "")
@@ -822,9 +803,6 @@ class MAGMemory(MemoryBase):
         self.mag_use_entity_boost = linear_rag_config is not None and linear_rag_config.get("use_entity_boost", False) if linear_rag_config else False
         self.mag_use_entity_match = linear_rag_config.get("use_entity_match", False) if linear_rag_config else False
         self.mag_use_context_window = linear_rag_config.get("use_context_window", False) if linear_rag_config else False
-        self.mag_use_entity_bridges = linear_rag_config.get("use_entity_bridges", True) if linear_rag_config else True
-        self.mag_entity_bridge_window = linear_rag_config.get("entity_bridge_window", 2) if linear_rag_config else 2
-        self.mag_entity_bridge_max_entities = linear_rag_config.get("entity_bridge_max_entities_per_sentence", 6) if linear_rag_config else 6
         self.mag_bm25_weight = linear_rag_config.get("bm25_weight", 1.0) if linear_rag_config else 1.0
         self.mag_filter_short = linear_rag_config.get("filter_short", False) if linear_rag_config else False
         self.mag_merge_short = linear_rag_config.get("merge_short", False) if linear_rag_config else False
@@ -2431,7 +2409,7 @@ class MAGMemory(MemoryBase):
     # ==================================================================
 
     def _mag_sentence_pipeline(self, messages, metadata: Dict[str, Any], filters: Dict[str, Any], default_timestamp: datetime = None) -> List[Dict[str, Any]]:
-        """S1分句→S2实体→S3Attention→S4存原始句子→S5LLM判别连边→S6图索引"""
+        """S1分句→S2存原始句子→S3 LLM直抽三元组→S4 triples建图"""
         import hashlib as _hashlib
         from mem0.utils.lemmatization import lemmatize_for_bm25 as _lemmatize
 
@@ -2441,13 +2419,7 @@ class MAGMemory(MemoryBase):
             return []
         sentence_texts = [s[0] for s in sentences]
 
-        all_entities = self.entity_extractor.extract_batch(sentence_texts)
-        all_ew: List[List[EntityWeight]] = []
-        for text, entities in zip(sentence_texts, all_entities):
-            ews = self.attention_scorer.score(text, [e[0] for e in entities], [e[1] for e in entities]) if entities and self.mag_use_attention else []
-            if not self.mag_use_attention and entities:
-                ews = [EntityWeight(name=e[0], attention_weight=0.5, entity_type=e[1]) for e in entities]
-            all_ew.append(ews)
+        all_ew: List[List[EntityWeight]] = [[] for _ in sentence_texts]
 
         try:
             embeddings = self.embedding_model.embed_batch(sentence_texts, "add")
@@ -2523,19 +2495,6 @@ class MAGMemory(MemoryBase):
                 except Exception:
                     pass
 
-            # ── mem0 entity_store 写入 (可 ablation: mag_use_entity_store=False 跳过) ──
-            # 使 mem0 的 _compute_entity_boosts() 能通过 linked_memory_ids 找到 MAG 句子
-            if self.mag_use_entity_store and all_ew[i]:
-                try:
-                    for ew in all_ew[i]:
-                        scoped_filters = {k: v for k, v in filters.items()
-                                         if k in ("user_id", "agent_id", "run_id") and v}
-                        self._upsert_entity(ew.name,
-                                           f"MAG_{ew.entity_type}" if ew.entity_type else "MAG_ENTITY",
-                                           sid, scoped_filters)
-                except Exception:
-                    pass
-
         if dedup_skipped:
             logger.info("MAG dedup: skipped %d duplicate sentences", dedup_skipped)
 
@@ -2557,139 +2516,48 @@ class MAGMemory(MemoryBase):
             if ctx_updated:
                 logger.debug("MAG context_window: linked %d sentences", ctx_updated)
 
-        # ── S5: 关系连边 — 实体积累模式 (按实体数量阈值触发 LLM) ──
+        # ── S5: 关系连边 — LLM 直接输出 triples + source_sentence_id ──
+        direct_triples_added = 0
         if self.mag_relation_batch_size > 0:
             if self.mag_edge_entity_threshold > 0:
-                # 积累模式: 跨 add() 积累句子，检测 user_id 切换自动 flush
+                # 积累模式: 跨 add() 积累句子，检测 user_id 切换自动 flush。
+                # direct-triple 建图不再预抽实体，这里的阈值按句子数解释。
                 current_uid = filters.get("user_id", "")
                 if self._pending_uid and current_uid != self._pending_uid:
                     self._flush_edge_sentences()
                 self._pending_uid = current_uid
                 for i, sid in enumerate(sentence_ids):
-                    text = sentence_texts[i]
+                    text = sentence_texts[filtered_idx[i]]
                     if text.strip():
                         self._pending_edge_sentences.append((sid, text))
-                        self._pending_edge_entity_count += len(all_ew[i])
+                        self._pending_edge_entity_count += 1
                 if self._pending_edge_entity_count >= self.mag_edge_entity_threshold:
                     self._flush_edge_sentences()
             else:
-                # 即时模式: 每个 add() 内的句子直接 LLM 连边（+ 可选指代消解）
-                items = [(sid, sentence_texts[i]) for i, sid in enumerate(sentence_ids) if sentence_texts[i].strip()]
-                if len(items) >= 2:
-                    try:
-                        # 消解+关系 (可 ablation: mag_llm_segment / mag_coref_mode)
-                        if self.mag_llm_segment:
-                            try:
-                                ts_map = {}
-                                for sid, _ in items:
-                                    try:
-                                        rec = self.vector_store.get(vector_id=sid)
-                                        if rec and hasattr(rec, "payload"):
-                                            t = rec.payload.get("created_at", "")[:10]
-                                            if t: ts_map[sid] = t
-                                    except Exception: pass
-                                result = self.relation_detector.segment_and_relate(
-                                    items, carry_over=self._llm_segment_carry, timestamps=ts_map)
-                                self._llm_segment_carry = result.get("carry_over", [])
-                                # 先存储原子事实（生成新 fact UUID），再用新 fact ID 建边
-                                fact_pairs = self._store_atomic_facts_return_ids(
-                                    result.get("facts", []), result.get("merged_away", []), items)
-                                try:
-                                    if fact_pairs:
-                                        edge_triples = self.relation_detector.extract_from_context(fact_pairs)
-                                    else:
-                                        edge_triples = self.relation_detector.extract_from_context(items)
-                                    for t in edge_triples:
-                                        try:
-                                            self.graph_store.add_relation(
-                                                t.head, t.relation, t.tail, t.source_sentence_id, t.confidence,
-                                                session_scope=self._mag_session_scope_for_sentence(t.source_sentence_id, session_scope),
-                                            )
-                                        except Exception: pass
-                                except Exception as e: logger.warning("S5 relation failed: %s", str(e)[:200])
-                            except Exception as e:
-                                logger.warning("LLM segment+relate: %s", str(e)[:200])
-                        else:
-                            resolved = {}
-                            if self.mag_coref_mode == "rule":
-                                resolved = self.relation_detector.resolve_coreferences_rule(items)
-                            elif self.mag_coref_mode == "llm":
-                                try:
-                                    resolved = self.relation_detector.resolve_coreferences(items)
-                                except Exception as e:
-                                    logger.debug("Coref LLM: %s", str(e)[:100])
-                            for sid, rtext in resolved.items():
-                                try:
-                                    self.vector_store.update(
-                                        vector_id=sid, vector=None, payload={"data": rtext})
-                                except Exception: pass
-                            triples = self.relation_detector.extract_from_context(items)
-                            for t in triples:
-                                try:
-                                    self.graph_store.add_relation(
-                                        t.head, t.relation, t.tail, t.source_sentence_id, t.confidence,
-                                        session_scope=self._mag_session_scope_for_sentence(t.source_sentence_id, session_scope),
-                                    )
-                                except Exception:
-                                    pass
-                    except Exception as e:
-                        logger.debug("S5 relation detection: %s", str(e)[:100])
-
-        # ── S6: 实体节点立即写入图 ──
-        for i, sid in enumerate(sentence_ids):
-            speaker_name = str(sentences[filtered_idx[i]][1] if i < len(filtered_idx) else "").strip()
-            if (
-                speaker_name
-                and speaker_name.lower() not in {"user", "assistant", "system"}
-                and len(speaker_name) > 1
-            ):
-                try:
-                    self.graph_store.upsert_entity(
-                        speaker_name,
-                        0.8,
-                        sid,
-                        "PERSON",
-                        session_scope=session_scope,
-                    )
-                except Exception:
-                    pass
-            for ew in filtered_ew[i]:
-                try:
-                    self.graph_store.upsert_entity(
-                        ew.name,
-                        ew.attention_weight,
-                        sid,
-                        ew.entity_type,
-                        session_scope=session_scope,
-                    )
-                except Exception:
-                    pass
-
-        bridge_edges = 0
-        if sentence_ids:
-            try:
-                bridge_texts = [sentence_texts[idx] for idx in filtered_idx]
-                bridge_speakers = [sentences[idx][1] for idx in filtered_idx]
-                bridge_edges = self._mag_add_entity_context_bridges(
-                    sentence_ids,
-                    bridge_texts,
-                    filtered_ew,
-                    bridge_speakers,
-                    session_scope,
+                items = [
+                    (sid, sentence_texts[filtered_idx[i]])
+                    for i, sid in enumerate(sentence_ids)
+                    if sentence_texts[filtered_idx[i]].strip()
+                ]
+                direct_triples_added, entity_map = self._mag_index_direct_triples(
+                    items,
+                    session_scope=session_scope,
+                    filters=filters,
                 )
-            except Exception as e:
-                logger.debug("MAG entity context bridges: %s", str(e)[:100])
+                for i, sid in enumerate(sentence_ids):
+                    if sid in entity_map:
+                        filtered_ew[i] = entity_map[sid]
 
         # S5+S6 完后保存图到磁盘
         self._graph_save()
 
         gs = self.graph_store.stats()
         logger.info(
-            "MAG: %d sentences → graph(entities=%d, edges=%d, bridges=%d)",
+            "MAG: %d sentences → graph(entities=%d, edges=%d, direct_triples=%d)",
             len(sentence_texts),
             gs["num_entities"],
             gs["num_relations"],
-            bridge_edges,
+            direct_triples_added,
         )
         return [{"id": sid, "memory": sentence_texts[filtered_idx[i]], "event": "ADD",
                  "entities": [e.to_dict() for e in filtered_ew[i]], "speaker": sentences[filtered_idx[i]][1],
@@ -2736,47 +2604,13 @@ class MAGMemory(MemoryBase):
 
         for chunk_start in range(0, len(pending), batch_size):
             chunk = pending[chunk_start:chunk_start + batch_size]
-            # chunk: [(sid, text), ...] — LLM 读全文上下文抽关系
-
             try:
-                if self.mag_llm_segment:
-                    result = self.relation_detector.segment_and_relate(
-                        chunk, carry_over=self._llm_segment_carry)
-                    self._llm_segment_carry = result.get("carry_over", [])
-                    try:
-                        edge_triples = self.relation_detector.extract_from_context(chunk)
-                        for t in edge_triples:
-                            try:
-                                self.graph_store.add_relation(
-                                    t.head, t.relation, t.tail, t.source_sentence_id, t.confidence,
-                                    session_scope=self._mag_session_scope_for_sentence(t.source_sentence_id),
-                                )
-                            except Exception: pass
-                    except Exception as e: logger.warning("S5 relation failed: %s", str(e)[:200])
-                    self._store_atomic_facts(
-                        result.get("facts", []), result.get("merged_away", []), chunk)
-                else:
-                    if self.mag_coref_resolve:
-                        try:
-                            resolved = self.relation_detector.resolve_coreferences(chunk)
-                            for sid, rtext in resolved.items():
-                                try:
-                                    self.vector_store.update(
-                                        vector_id=sid, vector=None, payload={"data": rtext})
-                                except Exception: pass
-                        except Exception as e:
-                            logger.debug("Coref: %s", str(e)[:100])
-                    triples = self.relation_detector.extract_from_context(chunk)
-                if not self.mag_llm_segment:
-                    for t in triples:
-                        try:
-                            self.graph_store.add_relation(
-                                t.head, t.relation, t.tail, t.source_sentence_id, t.confidence,
-                                session_scope=self._mag_session_scope_for_sentence(t.source_sentence_id),
-                            )
-                            total_relations += 1
-                        except Exception:
-                            pass
+                added, _ = self._mag_index_direct_triples(
+                    chunk,
+                    session_scope=None,
+                    filters={},
+                )
+                total_relations += added
                 batch_count += 1
             except Exception as e:
                 logger.warning("flush_relations batch %d failed: %s", batch_count, str(e)[:200])
@@ -2790,18 +2624,6 @@ class MAGMemory(MemoryBase):
 
         # 持久化图到磁盘
         self._graph_save()
-
-        # 冲刷残留的 carry_over（最后一批的上下文）
-        if self.mag_llm_segment and self._llm_segment_carry:
-            try:
-                # 用carry_over内容做最后一次消解（不建图，只更新文本）
-                for sid, text in self._llm_segment_carry:
-                    try:
-                        self.vector_store.update(
-                            vector_id=sid, vector=None, payload={"data": text})
-                    except Exception: pass
-            except Exception: pass
-            self._llm_segment_carry = []
 
         return {"sentences": len(pending), "relations_added": total_relations,
                 "batches": batch_count}
@@ -2911,7 +2733,7 @@ class MAGMemory(MemoryBase):
         return fact_result
 
     def _flush_edge_sentences(self):
-        """批量处理积累的边候选句 — 实体数够阈值时触发。"""
+        """批量处理积累的边候选句 — LLM 直接输出 triples。"""
         if not self._pending_edge_sentences or len(self._pending_edge_sentences) < 2:
             # 不足 2 句时不处理，但保留已积累的句子继续等
             return
@@ -2919,62 +2741,12 @@ class MAGMemory(MemoryBase):
         self._pending_edge_sentences = []
         self._pending_edge_entity_count = 0
         try:
-            if self.mag_llm_segment:
-                # LLM 联合: segment→facts + 消解
-                # 收集时间戳
-                ts_map = {}
-                for sid, _ in pending:
-                    try:
-                        rec = self.vector_store.get(vector_id=sid)
-                        if rec and hasattr(rec, "payload"):
-                            t = rec.payload.get("created_at", "")[:10]
-                            if t: ts_map[sid] = t
-                    except Exception: pass
-                result = self.relation_detector.segment_and_relate(
-                    pending, carry_over=self._llm_segment_carry, timestamps=ts_map)
-                self._llm_segment_carry = result.get("carry_over", [])
-                # 先存储原子事实（生成新 fact UUID），再用新 fact ID 建边
-                fact_ids = self._store_atomic_facts_return_ids(
-                    result.get("facts", []), result.get("merged_away", []), pending)
-                # 用新 fact 的 (id, text) 建边，保证边的 source_sentence_ids 指向有效向量
-                try:
-                    new_items = []
-                    for fid, ftxt in fact_ids:
-                        new_items.append((fid, ftxt))
-                    if new_items:
-                        edge_triples = self.relation_detector.extract_from_context(new_items)
-                        logger.warning("S5: got %d edge_triples, graph before=%d edges",
-                                       len(edge_triples), self.graph_store.stats()['num_relations'])
-                        for t in edge_triples:
-                            try:
-                                self.graph_store.add_relation(t.head, t.relation, t.tail,
-                                                              t.source_sentence_id, t.confidence,
-                                                              session_scope=self._mag_session_scope_for_sentence(t.source_sentence_id))
-                            except Exception as e2:
-                                logger.warning("add_relation: %s", str(e2)[:100])
-                        logger.warning("S5: after add, graph=%d edges",
-                                       self.graph_store.stats()['num_relations'])
-                except Exception as e:
-                    logger.warning("S5 relation failed: %s", str(e)[:200])
-            else:
-                if self.mag_coref_resolve:
-                    try:
-                        resolved = self.relation_detector.resolve_coreferences(pending)
-                        for sid, rtext in resolved.items():
-                            try:
-                                self.vector_store.update(
-                                    vector_id=sid, vector=None, payload={"data": rtext})
-                            except Exception: pass
-                    except Exception as e:
-                        logger.debug("Coref: %s", str(e)[:100])
-                triples = self.relation_detector.extract_from_context(pending)
-                for t in triples:
-                    try:
-                        self.graph_store.add_relation(t.head, t.relation, t.tail,
-                                                      t.source_sentence_id, t.confidence,
-                                                      session_scope=self._mag_session_scope_for_sentence(t.source_sentence_id))
-                    except Exception:
-                        pass
+            added, _ = self._mag_index_direct_triples(
+                pending,
+                session_scope=None,
+                filters={},
+            )
+            logger.info("_flush_edge_sentences: indexed %d direct triples", added)
         except Exception as e:
             logger.warning("_flush_edge_sentences: %s", str(e)[:200])
         self._graph_save()
@@ -2983,108 +2755,113 @@ class MAGMemory(MemoryBase):
         """公开接口：强制 flush 积累的边候选句（session 边界等场景调用）。"""
         self._flush_edge_sentences()
 
-    def _mag_bridge_entities_for_sentence(
+    def _mag_index_direct_triples(
         self,
-        entities: List[EntityWeight],
-        speaker: str = "",
-    ) -> List[Tuple[str, str, float]]:
-        """Return bounded, normalized entities used for cross-sentence bridges."""
-        candidates: Dict[str, Tuple[str, str, float]] = {}
-        for entity in entities or []:
-            name = str(getattr(entity, "name", "") or "").strip().lower()
-            if not name:
-                continue
-            weight = float(getattr(entity, "attention_weight", 0.5) or 0.5)
-            entity_type = str(getattr(entity, "entity_type", "") or "")
-            existing = candidates.get(name)
-            if existing is None or weight > existing[2]:
-                candidates[name] = (name, entity_type, weight)
-
-        speaker_name = str(speaker or "").strip().lower()
-        if (
-            speaker_name
-            and speaker_name not in {"user", "assistant", "system"}
-            and len(speaker_name) > 1
-        ):
-            existing = candidates.get(speaker_name)
-            if existing is None or existing[2] < 0.8:
-                candidates[speaker_name] = (speaker_name, "PERSON", 0.8)
-
-        ranked = sorted(candidates.values(), key=lambda item: item[2], reverse=True)
-        return ranked[: max(1, int(self.mag_entity_bridge_max_entities))]
-
-    def _mag_add_entity_context_bridges(
-        self,
-        sentence_ids: List[str],
-        sentence_texts: List[str],
-        entity_lists: List[List[EntityWeight]],
-        speakers: List[str],
+        items: List[Tuple[str, str]],
         session_scope: Optional[str],
-    ) -> int:
-        """Connect entities from nearby sentences so graph traversal can aggregate facts.
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, Dict[str, List[EntityWeight]]]:
+        """Extract LLM triples and write graph nodes/edges using sentence ids."""
+        if not items:
+            return 0, {}
 
-        The bridge is generic and dataset-agnostic: for two nearby sentences in
-        the same session, entities in sentence A get low-confidence directed
-        edges to entities in sentence B, and each edge points to the opposite
-        sentence as evidence. This lets BFS recover the sentence that contains
-        the missing list item/fact without fabricating a summary node.
-        """
-        if not self.mag_use_entity_bridges or len(sentence_ids) < 2:
-            return 0
+        timestamps = self._mag_timestamps_for_items(items)
+        triples = self.relation_detector.extract_triples_direct(items, timestamps=timestamps)
+        if not triples:
+            return 0, {}
 
-        window = max(1, int(self.mag_entity_bridge_window or 1))
-        added = 0
-        entity_rows = [
-            self._mag_bridge_entities_for_sentence(entity_lists[i], speakers[i] if i < len(speakers) else "")
-            for i in range(len(sentence_ids))
-        ]
-
-        for i, left_entities in enumerate(entity_rows):
-            if not left_entities:
+        entity_map: Dict[str, Dict[str, EntityWeight]] = {}
+        for triple in triples:
+            sid = str(triple.source_sentence_id or "")
+            if not sid:
                 continue
-            for j in range(i + 1, min(len(sentence_ids), i + window + 1)):
-                right_entities = entity_rows[j]
-                if not right_entities:
+            scope = self._mag_session_scope_for_sentence(sid, session_scope)
+            confidence = max(0.1, min(1.0, float(triple.confidence or 0.8)))
+            for name in (triple.head, triple.tail):
+                entity_name = str(name or "").strip()
+                if not entity_name:
                     continue
-                distance = j - i
-                confidence = max(0.15, 0.35 / distance)
-                pair_count = 0
-                max_pairs = max(1, int(self.mag_entity_bridge_max_entities) ** 2)
-                for left_name, _, _ in left_entities:
-                    for right_name, _, _ in right_entities:
-                        if left_name == right_name:
-                            continue
-                        relation_right = _mag_entity_bridge_relation(
-                            sentence_texts[j] if j < len(sentence_texts) else "",
-                            {left_name, right_name},
-                        )
-                        relation_left = _mag_entity_bridge_relation(
-                            sentence_texts[i] if i < len(sentence_texts) else "",
-                            {left_name, right_name},
-                        )
-                        self.graph_store.add_relation(
-                            left_name,
-                            relation_right,
-                            right_name,
-                            sentence_ids[j],
-                            confidence,
-                            session_scope=session_scope,
-                        )
-                        self.graph_store.add_relation(
-                            right_name,
-                            relation_left,
-                            left_name,
-                            sentence_ids[i],
-                            confidence,
-                            session_scope=session_scope,
-                        )
-                        added += 2
-                        pair_count += 1
-                        if pair_count >= max_pairs:
-                            break
-                    if pair_count >= max_pairs:
-                        break
-        return added
+                existing = entity_map.setdefault(sid, {}).get(entity_name.lower())
+                if existing is None or confidence > existing.attention_weight:
+                    entity_map[sid][entity_name.lower()] = EntityWeight(
+                        name=entity_name,
+                        attention_weight=confidence,
+                        entity_type="LLM_ENTITY",
+                    )
+                self.graph_store.upsert_entity(
+                    entity_name,
+                    confidence,
+                    sid,
+                    "LLM_ENTITY",
+                    session_scope=scope,
+                )
+            self.graph_store.add_relation(
+                triple.head,
+                triple.relation,
+                triple.tail,
+                sid,
+                confidence,
+                session_scope=scope,
+            )
+
+        merged_entity_map = {
+            sid: sorted(values.values(), key=lambda entity: entity.attention_weight, reverse=True)
+            for sid, values in entity_map.items()
+        }
+        self._mag_update_sentence_entities_from_triples(merged_entity_map, filters or {})
+        return len(triples), merged_entity_map
+
+    def _mag_timestamps_for_items(self, items: List[Tuple[str, str]]) -> Dict[str, str]:
+        timestamps: Dict[str, str] = {}
+        for sid, _ in items:
+            try:
+                rec = self.vector_store.get(vector_id=sid)
+                if rec and hasattr(rec, "payload") and isinstance(rec.payload, dict):
+                    created_at = str(rec.payload.get("created_at", ""))
+                    if created_at:
+                        timestamps[sid] = created_at[:10]
+            except Exception:
+                pass
+        return timestamps
+
+    def _mag_update_sentence_entities_from_triples(
+        self,
+        entity_map: Dict[str, List[EntityWeight]],
+        filters: Dict[str, Any],
+    ) -> None:
+        for sid, entities in entity_map.items():
+            payload_entities = [entity.to_dict() for entity in entities]
+            try:
+                self.vector_store.update(
+                    vector_id=sid,
+                    vector=None,
+                    payload={"entities": payload_entities},
+                )
+            except Exception:
+                pass
+            if not self.mag_use_entity_store:
+                continue
+            scoped_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+            if not scoped_filters:
+                scoped_filters = self._mag_filters_for_sentence(sid)
+            for entity in entities:
+                try:
+                    self._upsert_entity(entity.name, "MAG_LLM_ENTITY", sid, scoped_filters)
+                except Exception:
+                    pass
+
+    def _mag_filters_for_sentence(self, sentence_id: str) -> Dict[str, Any]:
+        try:
+            rec = self.vector_store.get(vector_id=sentence_id)
+            if rec and hasattr(rec, "payload") and isinstance(rec.payload, dict):
+                return {
+                    key: rec.payload[key]
+                    for key in ("user_id", "agent_id", "run_id")
+                    if rec.payload.get(key)
+                }
+        except Exception:
+            pass
+        return {}
 
     def _mag_session_scope_for_sentence(
         self,
@@ -3157,7 +2934,11 @@ class MAGMemory(MemoryBase):
             for name, attrs in data.get("entities", {}).items():
                 g.add_node(name, **attrs)
             for e in data.get("edges", []):
-                g.add_edge(e["u"], e["v"], key=e.get("key"), **e.get("data", {}))
+                edge_data = e.get("data", {})
+                g.add_edge(e["u"], e["v"], key=e.get("key"), **edge_data)
+                relation = edge_data.get("type", "")
+                for sid in edge_data.get("source_sentence_ids", []) or []:
+                    self.graph_store._sentence_triples[sid].append((e["u"], relation, e["v"]))
             # 重建反向索引
             for n in g.nodes:
                 scopes = g.nodes[n].get("linked_sentence_scopes", {})

@@ -278,34 +278,54 @@ class BFSRetriever:
 
                     hop_weight = weight * (self.decay_factor ** hop)
 
-                    # 从边(cur→neighbor)取三元组文本 + source_sentence_ids
-                    edge_sids = []
-                    edge_triples = []  # [(cur, relation, neighbor), ...]
-                    triple_texts = []  # "head relation tail" 用于语义相似度
-                    for k, edge_data in g[cur].get(neighbor, {}).items():
-                        if not self.graph_store._edge_matches_scope(edge_data, session_scope):
-                            continue
-                        sids = edge_data.get("source_sentence_ids", [])
-                        scopes = edge_data.get("source_sentence_scopes", {})
-                        scoped_sids = [
-                            sid for sid in sids
-                            if not session_scope or scopes.get(sid, edge_data.get("session_scope", "")) == session_scope
-                        ]
-                        edge_sids.extend(scoped_sids)
-                        rel = edge_data.get("type", "related")
-                        if scoped_sids:
-                            edge_triples.append((cur, rel, neighbor))
-                            triple_texts.append(f"{cur} {rel} {neighbor}")
+                    # 从 cur↔neighbor 的所有 MultiDiGraph 边取三元组文本和 source ids。
+                    # direct-triple 建图允许两个节点间多条边，也允许遍历反向边。
+                    edge_triples = []  # [(head, relation, tail), ...]
+                    triple_sources: List[Tuple[str, str]] = []  # [(sid, "head relation tail"), ...]
+                    edge_groups = []
+                    if g.has_edge(cur, neighbor):
+                        edge_groups.append((cur, neighbor, g[cur].get(neighbor, {})))
+                    if g.has_edge(neighbor, cur):
+                        edge_groups.append((neighbor, cur, g[neighbor].get(cur, {})))
+
+                    for head, tail, edge_map in edge_groups:
+                        for _, edge_data in edge_map.items():
+                            if not self.graph_store._edge_matches_scope(edge_data, session_scope):
+                                continue
+                            rel = edge_data.get("type", "related")
+                            sids = edge_data.get("source_sentence_ids", [])
+                            scopes = edge_data.get("source_sentence_scopes", {})
+                            scoped_sids = [
+                                sid for sid in sids
+                                if not session_scope
+                                or scopes.get(sid, edge_data.get("session_scope", "")) == session_scope
+                            ]
+                            if not scoped_sids:
+                                continue
+                            edge_triples.append((head, rel, tail))
+                            triple_text = f"{head} {rel} {tail}"
+                            for sid in scoped_sids:
+                                triple_sources.append((sid, triple_text))
 
                     # 用三元组文本算相似度（比句子向量更直接反映关系语义）
-                    neighbor_sims = [(sid, get_semantic_sim(txt))
-                                     for sid, txt in zip(edge_sids, triple_texts)] if edge_sids else []
+                    neighbor_sims = [
+                        (sid, get_semantic_sim(triple_text))
+                        for sid, triple_text in triple_sources
+                    ] if triple_sources else []
 
                     if not neighbor_sims:
                         continue
 
-                    best_sim = max(s for _, s in neighbor_sims)
-                    best_sid = max(neighbor_sims, key=lambda x: x[1])[0]
+                    ranked_edge_sims = sorted(neighbor_sims, key=lambda item: item[1], reverse=True)
+                    best_sim = ranked_edge_sims[0][1]
+                    selected_sids = []
+                    for sid, sim in ranked_edge_sims:
+                        if sim < sim_threshold and selected_sids:
+                            continue
+                        if sid not in selected_sids:
+                            selected_sids.append(sid)
+                        if len(selected_sids) >= 5:
+                            break
 
                     new_tol = tol_used
                     if best_sim < sim_threshold:
@@ -317,7 +337,7 @@ class BFSRetriever:
                         continue  # 超过容忍度，剪枝
 
                     new_path_ents = path_ents + [neighbor]
-                    new_path_sids = path_sids + [best_sid]
+                    new_path_sids = path_sids + selected_sids
                     new_step_sims = step_sims + [best_sim]
 
                     # 实体 boost
