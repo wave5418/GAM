@@ -56,9 +56,7 @@ from mag.schema import EntityWeight
 from mag.segmentation import SentenceSegmenter
 from mag.graph import (
     BFSRetriever,
-    DiscriminativeRelationDetector,
-    EntityAttentionScorer,
-    EntityExtractor,
+    DirectTripleExtractor,
     GraphStore,
 )
 
@@ -751,16 +749,13 @@ class MAGMemory(MemoryBase):
 
     在原始 mem0 管道中直接植入:
       1. 句子粒度切分
-      2. 知识图谱索引 (先抽实体→LLM判别式连边→source_sentence_id反向引用)
-      3. Entity Attention 权重
-      4. LinearRAG 在线补充
+      2. LLM 直接抽取 triples，并用 source_sentence_id 反向引用原句
+      3. 图 BFS / rerank / LinearRAG 在线补充
     """
 
     def __init__(self, config: MemoryConfig = MemoryConfig(),
                  *, mag_enabled: bool = True,
                  segmentation_strategy: str = "nlp",
-                 entity_strategy: str = "spacy",
-                 attention_strategy: str = "syntactic",
                  graph_config: Optional[Dict[str, Any]] = None,
                  linear_rag_config: Optional[Dict[str, Any]] = None):
         self.config = config
@@ -792,7 +787,6 @@ class MAGMemory(MemoryBase):
 
         # ── MAG 增强组件 (全部可独立开关，ablation-friendly) ──
         self.mag_enabled = mag_enabled
-        self.mag_use_attention = attention_strategy != "off"
         self.mag_relation_batch_size = linear_rag_config.get("relation_batch_size", 15) if linear_rag_config else 15
         self.mag_use_linear_rag = linear_rag_config is not None and linear_rag_config.get("enabled", True)
         self.mag_use_bfs = linear_rag_config is not None and linear_rag_config.get("use_bfs", True) and self.mag_relation_batch_size > 0
@@ -804,15 +798,9 @@ class MAGMemory(MemoryBase):
         self.mag_use_entity_match = linear_rag_config.get("use_entity_match", False) if linear_rag_config else False
         self.mag_use_context_window = linear_rag_config.get("use_context_window", False) if linear_rag_config else False
         self.mag_bm25_weight = linear_rag_config.get("bm25_weight", 1.0) if linear_rag_config else 1.0
-        self.mag_filter_short = linear_rag_config.get("filter_short", False) if linear_rag_config else False
-        self.mag_merge_short = linear_rag_config.get("merge_short", False) if linear_rag_config else False
-        self.mag_coref_mode = linear_rag_config.get("coref_mode", "off") if linear_rag_config else "off"
-        self.mag_coref_resolve = self.mag_coref_mode != "off"  # back compat
-        self.mag_llm_segment = linear_rag_config.get("llm_segment", False) if linear_rag_config else False
-        self._llm_segment_carry: List[Tuple[str, str]] = []  # 跨 batch 的上下文
         self._seen_hashes: Set[str] = set()  # 内存去重，不依赖外部查询
 
-        # 实体积累连边: 积累句子直到实体数达到阈值，再 batch LLM 判别
+        # 句子积累连边: 积累句子直到阈值，再 batch LLM 直抽 triples
         self.mag_edge_entity_threshold = linear_rag_config.get("edge_entity_threshold", 0) if linear_rag_config else 0
         self._pending_edge_sentences: List[Tuple[str, str]] = []  # [(sid, text), ...]
         self._pending_edge_entity_count: int = 0
@@ -824,12 +812,7 @@ class MAGMemory(MemoryBase):
         if mag_enabled:
             llm = self.llm
             self.segmenter = SentenceSegmenter(strategy=segmentation_strategy, llm_client=llm)
-            self.entity_extractor = EntityExtractor(
-                llm_client=llm, use_llm=(entity_strategy == "llm"),
-                use_mem0=(entity_strategy == "mem0"),
-            )
-            self.relation_detector = DiscriminativeRelationDetector(llm_client=llm)
-            self.attention_scorer = EntityAttentionScorer(strategy=attention_strategy, llm_client=llm)
+            self.triple_extractor = DirectTripleExtractor(llm_client=llm)
             self.graph_store = GraphStore(graph_config or {})
             self.bfs_retriever = BFSRetriever(self.graph_store)
 
@@ -2443,27 +2426,6 @@ class MAGMemory(MemoryBase):
                     continue
                 self._seen_hashes.add(mem_hash)
 
-            # ── 短句合并 (可 ablation: mag_merge_short=False 跳过) ──
-            # LLM segment模式自行处理分句，跳过规则合并避免冲突
-            if self.mag_merge_short and not self.mag_llm_segment:
-                if len(text) < 25 and len(all_ew[i]) == 0:
-                    if sentence_ids:
-                        # 更新前一句的 payload: 拼接文本和实体
-                        prev_sid = sentence_ids[-1]
-                        try:
-                            prev_rec = self.vector_store.get(vector_id=prev_sid)
-                            if prev_rec and hasattr(prev_rec, "payload"):
-                                prev_p = prev_rec.payload
-                                merged_text = prev_p.get("data", "") + " " + text
-                                merged_ents = list(prev_p.get("entities", []))
-                                self.vector_store.update(
-                                    vector_id=prev_sid, vector=None,
-                                    payload={"data": merged_text, "entities": merged_ents},
-                                )
-                        except Exception:
-                            pass
-                    continue  # 不加入 sentence_ids，不参与检索
-
             sentence_ids.append(sid)
             self._mag_sentence_scopes[sid] = session_scope
             filtered_ew.append(all_ew[i])  # 对齐: 跳过 dedup/merge 后保持索引一致
@@ -2628,110 +2590,6 @@ class MAGMemory(MemoryBase):
         return {"sentences": len(pending), "relations_added": total_relations,
                 "batches": batch_count}
 
-    def _store_atomic_facts(self, facts: List[str], merged_away: List[str],
-                            original_items: List[Tuple[str, str]]):
-        """存储 LLM 生成的原子事实  (alias, returns None for compat)"""
-        return self._store_atomic_facts_return_ids(facts, merged_away, original_items)
-
-    def _store_atomic_facts_return_ids(self, facts: List[str], merged_away: List[str],
-                                        original_items: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        """存储 LLM 原子事实，返回 [(fact_id, fact_text), ...] 供后续建边"""
-        if not facts:
-            return []
-        # 从原句中继承时间戳和过滤字段（遍历所有句找到非空值）
-        first_sid, last_sid = original_items[0][0], original_items[-1][0]
-        ts = ""
-        inherited_fields = {}
-        prev_link = next_link = ""
-        for sid, _ in original_items:
-            try:
-                rec = self.vector_store.get(vector_id=sid)
-                if rec and hasattr(rec, "payload"):
-                    p = rec.payload
-                    if not prev_link:
-                        prev_link = p.get("prev_sentence_id", "")
-                    if not inherited_fields.get("user_id"):
-                        for k in ("user_id", "agent_id", "run_id"):
-                            if k in p and p[k]:
-                                inherited_fields[k] = p[k]
-                    if not ts:
-                        orig_ts = p.get("created_at", "")
-                        if orig_ts: ts = orig_ts
-                    if inherited_fields.get("user_id") and prev_link and ts:
-                        break  # 都找到了
-            except Exception: pass
-        if not ts:
-            ts = datetime.now(timezone.utc).isoformat()
-        try:
-            rec = self.vector_store.get(vector_id=last_sid)
-            if rec and hasattr(rec, "payload"):
-                p = rec.payload
-                if not next_link:
-                    next_link = p.get("next_sentence_id", "")
-        except Exception: pass
-
-        # 存 facts，建立 prev/next 链
-        import hashlib
-        fact_ids = []
-        fact_result = []  # [(fid, fact_text), ...]
-        for fact_text in facts:
-            fid = str(uuid.uuid4())
-            fact_ids.append(fid)
-            fact_result.append((fid, fact_text))
-            # 提取实体
-            entities_raw = self.entity_extractor.extract(fact_text)
-            entities_payload = [{"name": e[0], "attention_weight": 0.5, "entity_type": e[1]}
-                               for e in entities_raw]
-            fact_emb = self.embedding_model.embed(fact_text, "add")
-            # 提取 speaker（"Caroline: ..." → speaker="Caroline"）
-            speaker = ""
-            if ": " in fact_text:
-                speaker = fact_text.split(": ", 1)[0].strip()
-            payload = {
-                "data": fact_text,
-                "entities": entities_payload,
-                "speaker": speaker,
-                "sentence_id": fid,
-                "created_at": ts,
-                "updated_at": ts,
-                "hash": hashlib.md5(fact_text.encode()).hexdigest(),
-                "text_lemmatized": lemmatize_for_bm25(fact_text),
-                **inherited_fields,  # user_id, agent_id, run_id
-            }
-            self.vector_store.insert(vectors=[fact_emb], ids=[fid], payloads=[payload])
-            self._mag_sentence_scopes[fid] = _build_session_scope(inherited_fields)
-
-        # 建立 prev/next 链接
-        if fact_ids:
-            # 第一个 fact → 原链 prev
-            if prev_link:
-                try:
-                    self.vector_store.update(vector_id=fact_ids[0], vector=None,
-                                             payload={"prev_sentence_id": prev_link})
-                    self.vector_store.update(vector_id=prev_link, vector=None,
-                                             payload={"next_sentence_id": fact_ids[0]})
-                except Exception: pass
-            # 最后一个 fact → 原链 next
-            if next_link:
-                try:
-                    self.vector_store.update(vector_id=fact_ids[-1], vector=None,
-                                             payload={"next_sentence_id": next_link})
-                    self.vector_store.update(vector_id=next_link, vector=None,
-                                             payload={"prev_sentence_id": fact_ids[-1]})
-                except Exception: pass
-            # facts 之间互相链接
-            for i in range(len(fact_ids) - 1):
-                try:
-                    self.vector_store.update(vector_id=fact_ids[i], vector=None,
-                                             payload={"next_sentence_id": fact_ids[i+1]})
-                    self.vector_store.update(vector_id=fact_ids[i+1], vector=None,
-                                             payload={"prev_sentence_id": fact_ids[i]})
-                except Exception: pass
-
-        # 被合并的旧句保留原向量，不做任何修改（BFS 需要原向量计算语义相似度）
-        # merged_away 句子的 UUID 仍在边的 source_sentence_ids 中，必须保留完整数据
-        return fact_result
-
     def _flush_edge_sentences(self):
         """批量处理积累的边候选句 — LLM 直接输出 triples。"""
         if not self._pending_edge_sentences or len(self._pending_edge_sentences) < 2:
@@ -2766,7 +2624,7 @@ class MAGMemory(MemoryBase):
             return 0, {}
 
         timestamps = self._mag_timestamps_for_items(items)
-        triples = self.relation_detector.extract_triples_direct(items, timestamps=timestamps)
+        triples = self.triple_extractor.extract_triples_direct(items, timestamps=timestamps)
         if not triples:
             return 0, {}
 

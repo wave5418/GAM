@@ -25,8 +25,6 @@ class MAGClient:
             config,
             mag_enabled=self._cfg.mag_enabled,
             segmentation_strategy=self._cfg.segmentation_strategy,
-            entity_strategy=self._cfg.entity_strategy,
-            attention_strategy=self._cfg.attention_strategy,
             graph_config=self._cfg.to_graph_config(project_name),
             linear_rag_config=self._cfg.to_linear_rag_config(),
         )

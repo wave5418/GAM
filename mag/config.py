@@ -61,29 +61,14 @@ class MAGConfig:
     segmentation_strategy: str = "nlp"
 
     # ═══════════════════════════════════════════════════════════════
-    # 实体抽取策略: "spacy" | "llm"
-    # ═══════════════════════════════════════════════════════════════
-    entity_strategy: str = "spacy"
-
-    # ═══════════════════════════════════════════════════════════════
-    # Entity Attention 策略
-    #   "off"       — 不计算权重，所有实体统一 0.5
-    #   "semantic"  — embedding 余弦相似度 (sentence vs entity)
-    #   "syntactic" — spaCy 依存树位置 (主语 > 宾语 > 介词短语)
-    #   "llm"       — LLM 评估 centrality
-    #   "cross_encoder" — CrossEncoder pair scoring
-    # ═══════════════════════════════════════════════════════════════
-    attention_strategy: str = "semantic"
-
-    # ═══════════════════════════════════════════════════════════════
-    # 图 — 关系连边 (S5 session-batch)
+    # 图 — LLM direct triples (S5 session-batch)
     #   relation_batch_size: 每批 LLM 处理的句子数
     #     0 = 禁用连边（图只有独立实体节点，无边）
-    #     N = 同 session 积累 N 句后批量 LLM 判别
+    #     N = 同 session 积累 N 句后批量 LLM 直抽 triples
     # ═══════════════════════════════════════════════════════════════
     relation_batch_size: int = 20
 
-    # 实体积累阈值: 积累句子直到实体数 >= 此值才触发 LLM 连边
+    # 句子积累阈值: 积累句子直到句子数 >= 此值才触发 LLM 连边
     # 0 = 即时模式（每个 add() 单独 LLM），>0 = 积累模式
     edge_entity_threshold: int = 0
 
@@ -100,8 +85,7 @@ class MAGConfig:
     #   公式: score = 0.3 * raw + 0.7 * sigmoid(logit)
     use_rerank: bool = True
 
-    # Entity Attention Boost — 双高加分 (coverage × quality)
-    #   仅在 attention_strategy != "off" 时生效
+    # Entity Boost — 使用 LLM triples 写回的实体 payload 做检索加权
     use_entity_boost: bool = True
 
     # Entity Match Boost — 简单计数: 句子和 query 共现实体越多分越高
@@ -125,21 +109,6 @@ class MAGConfig:
 
     # BM25 权重 — 降低到 < 1.0 可减少短句噪声
     bm25_weight: float = 1.0
-
-    # 过滤短句 — 摄入时跳过无实体且 < 20 字符的句子
-    filter_short: bool = False
-
-    # 短句合并 — 无实体短句附着到前一句，不独立参与检索
-    merge_short: bool = False
-
-    # 指代还原 — 摄入时简单替换代词为上文实体
-    coref_replace: bool = False
-
-    # 指代消解模式: "off" | "rule" | "llm"
-    coref_mode: str = "off"
-
-    # LLM 联合分句+消解+关系 — 一次调用完成三项
-    llm_segment: bool = False
 
     # ═══════════════════════════════════════════════════════════════
     # LinearRAG 在线补充 (已废弃，保留开关)
@@ -199,8 +168,6 @@ class MAGConfig:
             qdrant_path=_env("QDRANT_PATH", ""),
             mag_enabled=_bool("ENABLED", True),
             segmentation_strategy=_env("SEGMENTATION", "nlp"),
-            entity_strategy=_env("ENTITY_STRATEGY", "spacy"),
-            attention_strategy=_env("ATTENTION", "semantic"),
             relation_batch_size=_int("RELATION_BATCH", 20),
             edge_entity_threshold=_int("EDGE_ENTITY_THRESHOLD", 0),
             use_bfs=_bool("USE_BFS", True),
@@ -212,11 +179,6 @@ class MAGConfig:
             use_dedup=_bool("USE_DEDUP", True),
             use_context_window=_bool("USE_CONTEXT_WINDOW", False),
             bm25_weight=_float("BM25_WEIGHT", 1.0),
-            filter_short=_bool("FILTER_SHORT", False),
-            merge_short=_bool("MERGE_SHORT", False),
-            coref_replace=_bool("COREF_REPLACE", False),
-            coref_mode=_env("COREF_MODE", "off"),
-            llm_segment=_bool("LLM_SEGMENT", False),
             linear_rag_enabled=_bool("LINEARRAG", False),
             linear_rag_quality_threshold=_float("QUALITY_THRESHOLD", 0.3),
             linear_rag_max_supplement_rounds=_int("MAX_SUPPLEMENT_ROUNDS", 2),
@@ -298,11 +260,6 @@ class MAGConfig:
             "use_dedup": self.use_dedup,
             "use_context_window": self.use_context_window,
             "bm25_weight": self.bm25_weight,
-            "filter_short": self.filter_short,
-            "merge_short": self.merge_short,
-            "coref_replace": self.coref_replace,
-            "coref_mode": self.coref_mode,
-            "llm_segment": self.llm_segment,
             "quality_threshold": self.linear_rag_quality_threshold,
             "max_supplement_rounds": self.linear_rag_max_supplement_rounds,
         }
@@ -323,15 +280,10 @@ class MAGConfig:
             "rerank": self.use_rerank,
             "entity_boost": self.use_entity_boost,
             "entity_match": self.use_entity_match,
-            "attention": self.attention_strategy != "off",
-            "attention_strategy": self.attention_strategy,
             "relation_batch": self.relation_batch_size,
             "entity_store": self.use_entity_store,
             "history": self.use_history,
             "dedup": self.use_dedup,
             "context_window": self.use_context_window,
             "bm25_weight": self.bm25_weight,
-            "filter_short": self.filter_short,
-            "coref_replace": self.coref_replace,
-            "coref_mode": self.coref_mode,
         }

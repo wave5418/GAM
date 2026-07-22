@@ -1,6 +1,6 @@
 import json
 
-from mag.graph.extraction import DiscriminativeRelationDetector
+from mag.graph.extraction import DirectTripleExtractor
 
 
 class FakeLLM:
@@ -12,7 +12,7 @@ class FakeLLM:
 
 
 def test_direct_triple_extraction_uses_llm_source_sentence_ids():
-    detector = DiscriminativeRelationDetector(
+    detector = DirectTripleExtractor(
         llm_client=FakeLLM({
             "triples": [
                 {
