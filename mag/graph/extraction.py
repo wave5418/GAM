@@ -11,11 +11,11 @@ import json
 import logging
 from typing import Dict, List, Optional, Tuple
 
-from mag.schema import Triple
+from mag.schema import ExtractedFact, Triple
 
 logger = logging.getLogger(__name__)
 
-_DIRECT_TRIPLE_PROMPT = """Extract explicit knowledge triples from the conversation sentences.
+_DIRECT_TRIPLE_PROMPT = """Extract source-bound atomic facts and knowledge triples from conversation sentences.
 
 Each input item has:
 - sentence_id: stable id that MUST be copied exactly into each extracted triple
@@ -23,29 +23,34 @@ Each input item has:
 - text: sentence text, often with speaker prefix
 
 Task:
-- For each sentence, preserve the original sentence's facts and meaning. Do not paraphrase, summarize, generalize, or add new facts.
-- Use local conversation context only to resolve references inside that sentence: pronouns, possessives, deixis, ellipsis, and references such as I/me/my/you/your/he/she/they/we/it/this/that/there/then/the former/the latter.
-- After reference resolution, the sentence's meaning should be understandable without reading any other sentence.
-- Then extract triples as (head, relation, tail, source_sentence_id) from that reference-resolved sentence meaning.
-- Include facts about events, attributes, preferences, ownership, locations, dates, recommendations, list items, and counts
-- Prefer complete triples over generic "related" links
+- First extract atomic facts. Each fact must preserve the original sentence's facts and meaning. Do not paraphrase beyond reference resolution, summarize, generalize, or add new facts.
+- Use local conversation context only to resolve references inside each source sentence: pronouns, possessives, deixis, ellipsis, and references such as I/me/my/you/your/he/she/they/we/it/this/that/there/then/the former/the latter.
+- After reference resolution, each fact should be understandable without reading any other sentence.
+- Then extract triples from the extracted facts, not directly from the raw sentence text.
+- Include facts/triples about events, attributes, preferences, ownership, locations, dates, recommendations, list items, and counts.
+- Prefer complete facts and triples over generic "related" links.
 
 Rules:
 1. Use only facts supported by the provided sentences.
-2. Every triple MUST include a source_sentence_id copied exactly from one input item.
-3. If a fact requires multiple adjacent sentences, choose the sentence_id that contains the answer-bearing evidence.
-4. Keep heads and tails concise entity/value strings, not whole paragraphs.
-5. Do not output triples for pleasantries or unsupported assumptions.
-6. Do not use unresolved pronouns or vague references as graph nodes. Avoid heads or tails like "I", "me", "you", "we", "they", "it", "this", "that", "my family", or "her project" unless the phrase has been resolved to the concrete referent.
-7. Do not mechanically replace first-person pronouns with the speaker. Resolve only the referenced expressions needed for the original sentence to stand alone; if the referent is ambiguous, skip that triple.
-8. It is valid to output multiple triples between the same two nodes when they have different relations or source sentences.
+2. Every fact MUST include a fact_id and a source_sentence_id copied exactly from one input item.
+3. Every triple MUST include source_fact_id and source_sentence_id. source_fact_id MUST refer to one of the facts you output.
+4. If a fact requires multiple adjacent sentences only to resolve references, choose the source_sentence_id that contains the answer-bearing evidence.
+5. Keep facts atomic: one event, attribute, preference, ownership, location, date, recommendation, list item, or count per fact.
+6. Keep triple heads and tails concise entity/value strings, not whole paragraphs.
+7. Do not output facts or triples for pleasantries or unsupported assumptions.
+8. Do not use unresolved pronouns or vague references as fact subjects or graph nodes. Avoid heads or tails like "I", "me", "you", "we", "they", "it", "this", "that", "my family", or "her project" unless the phrase has been resolved to the concrete referent.
+9. Do not mechanically replace first-person pronouns with the speaker. Resolve only the referenced expressions needed for the original source sentence to stand alone; if the referent is ambiguous, skip that fact/triple.
+10. It is valid to output multiple triples between the same two nodes when they have different relations, facts, or source sentences.
 
 Input:
 {items}
 
 Return JSON:
-{{"triples": [
-  {{"head": "Alice", "relation": "likes", "tail": "piano", "source_sentence_id": "s1", "confidence": 0.9}}
+{{"facts": [
+  {{"fact_id": "f1", "source_sentence_id": "s1", "fact": "Alice likes piano.", "confidence": 0.9}}
+],
+"triples": [
+  {{"head": "Alice", "relation": "likes", "tail": "piano", "source_fact_id": "f1", "source_sentence_id": "s1", "confidence": 0.9}}
 ]}}"""
 
 
@@ -54,6 +59,7 @@ class DirectTripleExtractor:
 
     def __init__(self, llm_client=None):
         self.llm_client = llm_client
+        self.last_extracted_facts: List[ExtractedFact] = []
 
     def extract_triples_direct(
         self,
@@ -62,6 +68,7 @@ class DirectTripleExtractor:
     ) -> List[Triple]:
         """Extract triples with LLM-assigned, validated source sentence ids."""
         if not self.llm_client or not sentence_items:
+            self.last_extracted_facts = []
             return []
 
         sid_set = {sid for sid, _ in sentence_items}
@@ -75,6 +82,7 @@ class DirectTripleExtractor:
             if sid and text and text.strip()
         ]
         if not items:
+            self.last_extracted_facts = []
             return []
 
         prompt = _DIRECT_TRIPLE_PROMPT.format(
@@ -94,7 +102,30 @@ class DirectTripleExtractor:
             data = json.loads(response)
         except Exception as e:
             logger.warning("Direct triple extraction failed: %s", str(e)[:200])
+            self.last_extracted_facts = []
             return []
+
+        facts_by_id: Dict[str, ExtractedFact] = {}
+        for item in data.get("facts", []):
+            if not isinstance(item, dict):
+                continue
+            fact_id = str(item.get("fact_id", "")).strip()
+            fact_text = str(item.get("fact", "")).strip()
+            sid = str(item.get("source_sentence_id", "")).strip()
+            if not fact_id or not fact_text or sid not in sid_set:
+                continue
+            try:
+                confidence = float(item.get("confidence", 0.8))
+            except (TypeError, ValueError):
+                confidence = 0.8
+            confidence = max(0.0, min(1.0, confidence))
+            facts_by_id[fact_id] = ExtractedFact(
+                fact_id=fact_id,
+                fact=fact_text,
+                source_sentence_id=sid,
+                confidence=confidence,
+            )
+        self.last_extracted_facts = list(facts_by_id.values())
 
         triples: List[Triple] = []
         for item in data.get("triples", []):
@@ -106,6 +137,7 @@ class DirectTripleExtractor:
             if not head or not relation or not tail:
                 continue
 
+            source_fact_id = str(item.get("source_fact_id", "")).strip()
             source_ids = item.get("source_sentence_ids", item.get("source_sentence_id", ""))
             if isinstance(source_ids, str):
                 source_ids = [source_ids]
@@ -122,6 +154,11 @@ class DirectTripleExtractor:
                 sid_text = str(sid).strip()
                 if sid_text not in sid_set:
                     continue
+                source_fact = facts_by_id.get(source_fact_id)
+                if source_fact_id and (
+                    source_fact is None or source_fact.source_sentence_id != sid_text
+                ):
+                    continue
                 triples.append(
                     Triple(
                         head=head,
@@ -129,6 +166,8 @@ class DirectTripleExtractor:
                         tail=tail,
                         confidence=confidence,
                         source_sentence_id=sid_text,
+                        source_fact_id=source_fact_id,
+                        source_fact=source_fact.fact if source_fact else "",
                     )
                 )
         return triples

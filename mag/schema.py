@@ -50,6 +50,33 @@ class EntityWeight:
 
 
 @dataclass
+class ExtractedFact:
+    """Atomic source-bound fact used as an intermediate extraction layer."""
+
+    fact_id: str
+    fact: str
+    source_sentence_id: str
+    confidence: float = 1.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "fact_id": self.fact_id,
+            "fact": self.fact,
+            "source_sentence_id": self.source_sentence_id,
+            "confidence": self.confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ExtractedFact":
+        return cls(
+            fact_id=d["fact_id"],
+            fact=d["fact"],
+            source_sentence_id=d.get("source_sentence_id", ""),
+            confidence=d.get("confidence", 1.0),
+        )
+
+
+@dataclass
 class Triple:
     """SPO 三元组 — 从句子中抽取的知识片段"""
 
@@ -58,6 +85,8 @@ class Triple:
     tail: str  # 宾语实体
     confidence: float = 1.0  # 抽取置信度 [0, 1]
     source_sentence_id: str = ""  # ★ 反向引用到原始句子
+    source_fact_id: str = ""  # optional: 反向引用到中间 atomic fact
+    source_fact: str = ""  # optional: 中间 fact 文本，便于调试
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -66,6 +95,8 @@ class Triple:
             "tail": self.tail,
             "confidence": self.confidence,
             "source_sentence_id": self.source_sentence_id,
+            "source_fact_id": self.source_fact_id,
+            "source_fact": self.source_fact,
         }
 
     @classmethod
@@ -76,6 +107,8 @@ class Triple:
             tail=d["tail"],
             confidence=d.get("confidence", 1.0),
             source_sentence_id=d.get("source_sentence_id", ""),
+            source_fact_id=d.get("source_fact_id", ""),
+            source_fact=d.get("source_fact", ""),
         )
 
 

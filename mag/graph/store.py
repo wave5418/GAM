@@ -267,6 +267,8 @@ class GraphStore:
         source_sentence_id: str = "",
         confidence: float = 1.0,
         session_scope: Optional[str] = None,
+        source_fact_id: str = "",
+        source_fact: str = "",
     ):
         """
         添加或更新关系边。
@@ -306,6 +308,8 @@ class GraphStore:
                     REL_SCOPES: {source_sentence_id: session_scope or ""} if source_sentence_id else {},
                     "session_scope": session_scope or "",
                     "confidence": confidence,
+                    "source_fact_id": source_fact_id,
+                    "source_fact": source_fact,
                 },
             )
 
@@ -389,6 +393,8 @@ class GraphStore:
                     "tail": tail,
                     "confidence": edge_data.get("confidence", 1.0),
                     "source_sentence_ids": list(edge_data.get(REL_ORIGINS, [])),
+                    "source_fact_id": edge_data.get("source_fact_id", ""),
+                    "source_fact": edge_data.get("source_fact", ""),
                     "direction": "out",
                 })
 
@@ -402,6 +408,8 @@ class GraphStore:
                     "tail": entity_name,
                     "confidence": edge_data.get("confidence", 1.0),
                     "source_sentence_ids": list(edge_data.get(REL_ORIGINS, [])),
+                    "source_fact_id": edge_data.get("source_fact_id", ""),
+                    "source_fact": edge_data.get("source_fact", ""),
                     "direction": "in",
                 })
 

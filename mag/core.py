@@ -2660,6 +2660,8 @@ class MAGMemory(MemoryBase):
                 sid,
                 confidence,
                 session_scope=scope,
+                source_fact_id=triple.source_fact_id,
+                source_fact=triple.source_fact,
             )
 
         merged_entity_map = {

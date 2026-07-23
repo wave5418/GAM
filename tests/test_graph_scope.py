@@ -80,3 +80,23 @@ def test_path_search_reads_reverse_multiedges_with_distinct_sources():
 
     source_ids = {sid for path in paths for sid in path["sentences"]}
     assert {"s1", "s2"} <= source_ids
+
+
+def test_graph_store_preserves_source_fact_metadata():
+    graph = GraphStore()
+    graph.add_relation(
+        "Alice",
+        "painted",
+        "sunsets",
+        "s1",
+        confidence=0.9,
+        session_scope="user_id=a",
+        source_fact_id="f1",
+        source_fact="Alice painted sunsets.",
+    )
+
+    relations = graph.get_all_relations_for_entity("alice", session_scope="user_id=a")
+
+    assert len(relations) == 1
+    assert relations[0]["source_fact_id"] == "f1"
+    assert relations[0]["source_fact"] == "Alice painted sunsets."
