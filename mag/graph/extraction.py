@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from json import JSONDecodeError
 from typing import Dict, List, Optional, Tuple
 
 from mag.schema import ExtractedFact, Triple
 
 logger = logging.getLogger(__name__)
+_DEFAULT_DIRECT_TRIPLE_MAX_TOKENS = 8192
 
 _DIRECT_TRIPLE_PROMPT = """Extract source-bound atomic facts and knowledge triples from conversation sentences.
 
@@ -61,6 +64,14 @@ class DirectTripleExtractor:
         self.llm_client = llm_client
         self.last_extracted_facts: List[ExtractedFact] = []
 
+    def _max_tokens(self) -> int:
+        raw = os.getenv("MAG_DIRECT_TRIPLE_MAX_TOKENS", "")
+        try:
+            value = int(raw) if raw else _DEFAULT_DIRECT_TRIPLE_MAX_TOKENS
+        except ValueError:
+            value = _DEFAULT_DIRECT_TRIPLE_MAX_TOKENS
+        return max(1024, value)
+
     def extract_triples_direct(
         self,
         sentence_items: List[Tuple[str, str]],
@@ -85,6 +96,18 @@ class DirectTripleExtractor:
             self.last_extracted_facts = []
             return []
 
+        facts, triples = self._extract_items(items, timestamps or {})
+        self.last_extracted_facts = facts
+        return triples
+
+    def _extract_items(
+        self,
+        items: List[Dict[str, str]],
+        timestamps: Dict[str, str],
+    ) -> Tuple[List[ExtractedFact], List[Triple]]:
+        if not items:
+            return [], []
+
         prompt = _DIRECT_TRIPLE_PROMPT.format(
             items=json.dumps(items, ensure_ascii=False),
         )
@@ -98,13 +121,33 @@ class DirectTripleExtractor:
                     {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
+                max_tokens=self._max_tokens(),
             )
             data = json.loads(response)
+        except JSONDecodeError as e:
+            if len(items) > 1:
+                midpoint = len(items) // 2
+                logger.warning(
+                    "Direct triple extraction returned truncated/invalid JSON for %d items; retrying as %d + %d: %s",
+                    len(items),
+                    midpoint,
+                    len(items) - midpoint,
+                    str(e)[:200],
+                )
+                left_facts, left_triples = self._extract_items(items[:midpoint], timestamps)
+                right_facts, right_triples = self._extract_items(items[midpoint:], timestamps)
+                return left_facts + right_facts, left_triples + right_triples
+            logger.warning("Direct triple extraction failed for single item: %s", str(e)[:200])
+            return [], []
         except Exception as e:
             logger.warning("Direct triple extraction failed: %s", str(e)[:200])
-            self.last_extracted_facts = []
-            return []
+            return [], []
 
+        if not isinstance(data, dict):
+            logger.warning("Direct triple extraction returned non-object JSON: %s", type(data).__name__)
+            return [], []
+
+        sid_set = {str(item.get("sentence_id", "")).strip() for item in items}
         facts_by_id: Dict[str, ExtractedFact] = {}
         for item in data.get("facts", []):
             if not isinstance(item, dict):
@@ -125,7 +168,7 @@ class DirectTripleExtractor:
                 source_sentence_id=sid,
                 confidence=confidence,
             )
-        self.last_extracted_facts = list(facts_by_id.values())
+        facts = list(facts_by_id.values())
 
         triples: List[Triple] = []
         for item in data.get("triples", []):
@@ -170,4 +213,4 @@ class DirectTripleExtractor:
                         source_fact=source_fact.fact if source_fact else "",
                     )
                 )
-        return triples
+        return facts, triples

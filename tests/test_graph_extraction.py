@@ -11,6 +11,19 @@ class FakeLLM:
         return json.dumps(self.payload)
 
 
+class SequenceLLM:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def generate_response(self, **kwargs):
+        self.calls.append(kwargs)
+        response = self.responses.pop(0)
+        if isinstance(response, str):
+            return response
+        return json.dumps(response)
+
+
 def test_direct_triple_extraction_uses_llm_source_sentence_ids():
     detector = DirectTripleExtractor(
         llm_client=FakeLLM({
@@ -82,3 +95,62 @@ def test_direct_triple_extraction_uses_source_facts():
     assert len(triples) == 1
     assert triples[0].source_fact_id == "f1"
     assert triples[0].source_fact == "Alice painted sunsets."
+
+
+def test_direct_triple_extraction_retries_truncated_batch_by_splitting():
+    detector = DirectTripleExtractor(
+        llm_client=SequenceLLM(
+            [
+                '{"facts": [{"fact_id": "f1", "fact": "unterminated',
+                {
+                    "facts": [
+                        {
+                            "fact_id": "f1",
+                            "source_sentence_id": "s1",
+                            "fact": "Alice painted sunsets.",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "triples": [
+                        {
+                            "head": "Alice",
+                            "relation": "painted",
+                            "tail": "sunsets",
+                            "source_fact_id": "f1",
+                            "source_sentence_id": "s1",
+                            "confidence": 0.9,
+                        }
+                    ],
+                },
+                {
+                    "facts": [
+                        {
+                            "fact_id": "f1",
+                            "source_sentence_id": "s2",
+                            "fact": "Bob likes piano.",
+                            "confidence": 0.8,
+                        }
+                    ],
+                    "triples": [
+                        {
+                            "head": "Bob",
+                            "relation": "likes",
+                            "tail": "piano",
+                            "source_fact_id": "f1",
+                            "source_sentence_id": "s2",
+                            "confidence": 0.8,
+                        }
+                    ],
+                },
+            ]
+        )
+    )
+
+    triples = detector.extract_triples_direct(
+        [("s1", "Alice painted sunsets."), ("s2", "Bob likes piano.")]
+    )
+
+    assert [triple.source_sentence_id for triple in triples] == ["s1", "s2"]
+    assert len(detector.last_extracted_facts) == 2
+    assert len(detector.llm_client.calls) == 3
+    assert detector.llm_client.calls[0]["max_tokens"] >= 8192
