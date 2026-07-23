@@ -23,10 +23,10 @@ Each input item has:
 - text: sentence text, often with speaker prefix
 
 Task:
-- First interpret each sentence in its local conversation context and mentally rewrite it as a standalone sentence:
-  resolve pronouns, possessives, deixis, ellipsis, and references such as I/me/my/you/your/he/she/they/we/it/this/that/there/then/the former/the latter.
-- The rewritten meaning must be understandable without reading any other sentence.
-- Then extract triples as (head, relation, tail, source_sentence_id) from that context-resolved standalone meaning.
+- For each sentence, preserve the original sentence's facts and meaning. Do not paraphrase, summarize, generalize, or add new facts.
+- Use local conversation context only to resolve references inside that sentence: pronouns, possessives, deixis, ellipsis, and references such as I/me/my/you/your/he/she/they/we/it/this/that/there/then/the former/the latter.
+- After reference resolution, the sentence's meaning should be understandable without reading any other sentence.
+- Then extract triples as (head, relation, tail, source_sentence_id) from that reference-resolved sentence meaning.
 - Include facts about events, attributes, preferences, ownership, locations, dates, recommendations, list items, and counts
 - Prefer complete triples over generic "related" links
 
@@ -37,7 +37,7 @@ Rules:
 4. Keep heads and tails concise entity/value strings, not whole paragraphs.
 5. Do not output triples for pleasantries or unsupported assumptions.
 6. Do not use unresolved pronouns or vague references as graph nodes. Avoid heads or tails like "I", "me", "you", "we", "they", "it", "this", "that", "my family", or "her project" unless the phrase has been resolved to the concrete referent.
-7. Do not mechanically replace first-person pronouns with the speaker. Resolve the full referenced meaning from the surrounding context; if the referent is ambiguous, skip that triple.
+7. Do not mechanically replace first-person pronouns with the speaker. Resolve only the referenced expressions needed for the original sentence to stand alone; if the referent is ambiguous, skip that triple.
 8. It is valid to output multiple triples between the same two nodes when they have different relations or source sentences.
 
 Input:
