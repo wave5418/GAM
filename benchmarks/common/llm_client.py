@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, TypeVar
 
 from aiolimiter import AsyncLimiter
@@ -25,6 +26,44 @@ from aiolimiter import AsyncLimiter
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def _record_usage_jsonl(
+    *,
+    provider: str,
+    model: str,
+    call_type: str,
+    usage: Any,
+) -> None:
+    """Optionally append OpenAI-compatible token usage to MAG_LLM_USAGE_PATH."""
+    path = os.getenv("MAG_LLM_USAGE_PATH")
+    if not path or usage is None:
+        return
+    try:
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+        if prompt_tokens is None and isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+            return
+        row = {
+            "ts": time.time(),
+            "component": "benchmark_llm_client",
+            "provider": provider,
+            "model": model,
+            "call_type": call_type,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("Failed to record LLM usage", exc_info=True)
 
 
 class LLMClient:
@@ -176,6 +215,12 @@ class LLMClient:
                         timeout=self.timeout,
                     )
                 content = resp.choices[0].message.content
+                _record_usage_jsonl(
+                    provider=self.provider,
+                    model=self.model,
+                    call_type="generate",
+                    usage=getattr(resp, "usage", None),
+                )
                 if content is None:
                     logger.warning(
                         "Generation returned None (finish_reason=%s)",
@@ -278,6 +323,12 @@ class LLMClient:
                         timeout=self.timeout,
                     )
                 raw = resp.choices[0].message.content
+                _record_usage_jsonl(
+                    provider=self.provider,
+                    model=self.model,
+                    call_type="generate_structured",
+                    usage=getattr(resp, "usage", None),
+                )
                 if not raw:
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(2 * (attempt + 1))

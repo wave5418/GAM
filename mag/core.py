@@ -62,6 +62,7 @@ from mag.graph import (
 
 _MAG_KEY = "MAG_origin"
 _MAG_VAL = "sentence"
+_MAG_USAGE_LOCK = threading.Lock()
 
 # Suppress SWIG deprecation warnings globally
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*SwigPy.*")
@@ -740,6 +741,74 @@ def _build_session_scope(filters):
     return "&".join(parts)
 
 
+def _mag_record_llm_usage_jsonl(
+    *,
+    component: str,
+    provider: str,
+    model: str,
+    call_type: str,
+    usage: Any,
+) -> None:
+    """Optionally append OpenAI-compatible token usage to MAG_LLM_USAGE_PATH."""
+    path = os.getenv("MAG_LLM_USAGE_PATH")
+    if not path or usage is None:
+        return
+    try:
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+        if prompt_tokens is None and isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+            return
+        row = {
+            "ts": time.time(),
+            "component": component,
+            "provider": provider,
+            "model": model,
+            "call_type": call_type,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        line = json.dumps(row, ensure_ascii=False)
+        with _MAG_USAGE_LOCK:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+    except Exception:
+        logger.debug("Failed to record MAG LLM usage", exc_info=True)
+
+
+def _mag_wrap_sync_openai_llm_usage(llm: Any, *, provider: str) -> Any:
+    """Record usage from mem0 OpenAI-compatible sync LLM clients without changing outputs."""
+    try:
+        completions = llm.client.chat.completions
+        original_create = completions.create
+    except Exception:
+        return llm
+    if getattr(completions, "_mag_usage_wrapped", False):
+        return llm
+
+    def create_with_usage(*args, **kwargs):
+        response = original_create(*args, **kwargs)
+        model = kwargs.get("model") or getattr(getattr(llm, "config", None), "model", "")
+        _mag_record_llm_usage_jsonl(
+            component="mag_mem0_llm",
+            provider=provider,
+            model=model,
+            call_type="chat_completions_create",
+            usage=getattr(response, "usage", None),
+        )
+        return response
+
+    completions.create = create_with_usage
+    setattr(completions, "_mag_usage_wrapped", True)
+    return llm
+
+
 setup_config()
 logger = logging.getLogger(__name__)
 
@@ -768,7 +837,10 @@ class MAGMemory(MemoryBase):
         self.vector_store = VectorStoreFactory.create(
             self.config.vector_store.provider, self.config.vector_store.config
         )
-        self.llm = LlmFactory.create(self.config.llm.provider, self.config.llm.config)
+        self.llm = _mag_wrap_sync_openai_llm_usage(
+            LlmFactory.create(self.config.llm.provider, self.config.llm.config),
+            provider=self.config.llm.provider,
+        )
         self.db = SQLiteManager(self.config.history_db_path)
         self.collection_name = self.config.vector_store.config.collection_name
         self.api_version = self.config.version
@@ -3533,7 +3605,10 @@ class AsyncMemory(MemoryBase):
         self.vector_store = VectorStoreFactory.create(
             self.config.vector_store.provider, self.config.vector_store.config
         )
-        self.llm = LlmFactory.create(self.config.llm.provider, self.config.llm.config)
+        self.llm = _mag_wrap_sync_openai_llm_usage(
+            LlmFactory.create(self.config.llm.provider, self.config.llm.config),
+            provider=self.config.llm.provider,
+        )
         self.db = SQLiteManager(self.config.history_db_path)
         self.collection_name = self.config.vector_store.config.collection_name
         self.api_version = self.config.version
