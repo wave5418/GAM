@@ -618,17 +618,32 @@ def _mag_candidate_evidence_features(query: str, candidate: Dict[str, Any]) -> D
 def _mag_diverse_topk(candidates: List[Dict[str, Any]], limit: int, pool_size: int) -> List[Dict[str, Any]]:
     """Select high-scoring candidates while reducing near-duplicate evidence."""
     if limit <= 0 or len(candidates) <= limit:
-        return candidates[:limit]
+        selected = []
+        seen_ids = set()
+        for candidate in candidates:
+            cid = str(candidate.get("id", "") or "")
+            if cid and cid in seen_ids:
+                continue
+            if cid:
+                seen_ids.add(cid)
+            selected.append(candidate)
+            if len(selected) >= limit:
+                break
+        return selected
 
     pool = candidates[:pool_size]
     selected: List[Dict[str, Any]] = []
     selected_tokens: List[Set[str]] = []
+    selected_ids: Set[str] = set()
     max_score = max((c.get("score", 0.0) for c in pool), default=1.0) or 1.0
 
     while pool and len(selected) < limit:
         best_idx = 0
         best_score = float("-inf")
         for idx, candidate in enumerate(pool):
+            cid = str(candidate.get("id", "") or "")
+            if cid and cid in selected_ids:
+                continue
             tokens = _mag_text_tokens(candidate.get("memory", ""))
             similarity = max((_mag_jaccard(tokens, seen) for seen in selected_tokens), default=0.0)
             normalized_score = candidate.get("score", 0.0) / max_score
@@ -636,13 +651,102 @@ def _mag_diverse_topk(candidates: List[Dict[str, Any]], limit: int, pool_size: i
             if mmr_score > best_score:
                 best_score = mmr_score
                 best_idx = idx
+        if best_score == float("-inf"):
+            break
         chosen = pool.pop(best_idx)
         selected.append(chosen)
+        cid = str(chosen.get("id", "") or "")
+        if cid:
+            selected_ids.add(cid)
         selected_tokens.append(_mag_text_tokens(chosen.get("memory", "")))
 
     if len(selected) < limit:
-        selected.extend(candidates[len(selected):limit])
+        for candidate in candidates:
+            cid = str(candidate.get("id", "") or "")
+            if cid and cid in selected_ids:
+                continue
+            selected.append(candidate)
+            if cid:
+                selected_ids.add(cid)
+            if len(selected) >= limit:
+                break
     return selected
+
+
+def _mag_segment_text(segment: Dict[str, Any]) -> str:
+    text = str(segment.get("memory", "") or "").strip()
+    if not text:
+        return ""
+    created_at = str(segment.get("created_at", "") or "")
+    if created_at and not text.startswith("["):
+        return f"[{created_at[:10]}] {text}"
+    return text
+
+
+def _mag_dedupe_final_context(final: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ensure returned answer context does not repeat sentence ids."""
+    cleaned: List[Dict[str, Any]] = []
+    seen_sentence_ids: Set[str] = set()
+
+    for candidate in final:
+        cid = str(candidate.get("id", "") or "")
+        if cid and cid in seen_sentence_ids:
+            continue
+
+        segments = candidate.get("context_segments")
+        if not isinstance(segments, list) or not segments:
+            segments = [{
+                "id": cid,
+                "memory": candidate.get("_base_memory", candidate.get("memory", "")),
+                "created_at": candidate.get("created_at", ""),
+            }]
+
+        memory_parts: List[str] = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            sid = str(segment.get("id", "") or "")
+            if sid and sid in seen_sentence_ids:
+                continue
+            segment_text = _mag_segment_text(segment)
+            if not segment_text:
+                continue
+            memory_parts.append(segment_text)
+            if sid:
+                seen_sentence_ids.add(sid)
+
+        unique_supporting_context = []
+        supporting_context = candidate.get("supporting_context", [])
+        if isinstance(supporting_context, list):
+            for support in supporting_context:
+                if not isinstance(support, dict):
+                    continue
+                sid = str(support.get("id", "") or "")
+                if sid and sid in seen_sentence_ids:
+                    continue
+                support_text = str(support.get("memory", "") or "").strip()
+                if not support_text:
+                    continue
+                unique_supporting_context.append(support)
+                label = "previous" if support.get("direction") == "prev" else "next"
+                created_at = str(support.get("created_at", "") or "")
+                ts_prefix = f"[{created_at[:10]}] " if created_at else ""
+                memory_parts.append(f"[supporting {label}: {ts_prefix}{support_text}]")
+                if sid:
+                    seen_sentence_ids.add(sid)
+
+        if not memory_parts:
+            continue
+        candidate["memory"] = "\n".join(memory_parts)
+        if unique_supporting_context:
+            candidate["supporting_context"] = unique_supporting_context
+        else:
+            candidate.pop("supporting_context", None)
+        candidate.pop("_base_memory", None)
+        candidate.pop("context_segments", None)
+        cleaned.append(candidate)
+
+    return cleaned
 
 
 def _build_filters_and_metadata(
@@ -3180,13 +3284,19 @@ class MAGMemory(MemoryBase):
                         final_score = 0.25 * graph_score
 
                     ctx_lines, path_ts = [], ""
+                    context_segments = []
                     all_entities = []
-                    for _, p in scoped_payloads:
+                    for sid, p in scoped_payloads:
                         txt = p.get("data", "")
                         ts = p.get("created_at", "")
                         ents = p.get("entities", [])
                         if txt:
                             ctx_lines.append(f"[{ts[:10]}] {txt}" if ts else txt)
+                            context_segments.append({
+                                "id": sid,
+                                "memory": txt,
+                                "created_at": ts,
+                            })
                             if not path_ts:
                                 path_ts = ts
                             all_entities.extend(ents if isinstance(ents, list) else [])
@@ -3213,6 +3323,7 @@ class MAGMemory(MemoryBase):
                             "path_len": path_len,
                         },
                         "graph_path": path_info.get("path", []),
+                        "context_segments": context_segments,
                     }
                     gate = _mag_bfs_shadow_gate(
                         query,
@@ -3413,6 +3524,8 @@ class MAGMemory(MemoryBase):
         # Do not add neighbor sentences as independent high-score candidates;
         # they are evidence support unless they already passed graph/vector routes.
         if self.mag_use_context_window and merged_list:
+            for r in merged_list:
+                r.setdefault("_base_memory", r.get("memory", ""))
             seen_ids = {r.get("id", "") for r in merged_list}
             parent_ids = [str(r.get("id", "")) for r in merged_list if r.get("id")]
             self._mag_prefetch_scoped_payloads(parent_ids, filters, payload_cache)
@@ -3466,12 +3579,6 @@ class MAGMemory(MemoryBase):
                                         "memory": support_text,
                                         "created_at": support_ts,
                                     })
-                                    label = "previous" if direction == "prev_sentence_id" else "next"
-                                    ts_prefix = f"[{support_ts[:10]}] " if support_ts else ""
-                                    r["memory"] = (
-                                        f"{r.get('memory', '')}\n"
-                                        f"[supporting {label}: {ts_prefix}{support_text}]"
-                                    )
                                     r.setdefault("route_scores", {})["context_support_count"] = len(support)
                                     route_debug["context_support_attached"] += 1
                                 seen_ids.add(neighbor_id)
@@ -3485,6 +3592,7 @@ class MAGMemory(MemoryBase):
         diversity_pool_size = min(len(merged_list), max(limit * 4, 60))
         route_debug["diversity_pool_size"] = diversity_pool_size
         final = _mag_diverse_topk(merged_list, limit, diversity_pool_size)
+        final = _mag_dedupe_final_context(final)
         _mark_timing("diverse_topk")
 
         # ── 上下文组装 ──

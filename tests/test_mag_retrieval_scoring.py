@@ -4,6 +4,7 @@ from mag.core import (
     _mag_bfs_shadow_gate,
     _mag_build_query_plan,
     _mag_candidate_evidence_features,
+    _mag_dedupe_final_context,
     _mag_diverse_topk,
     _mag_time_constraints_match,
 )
@@ -101,6 +102,56 @@ def test_diverse_topk_keeps_high_score_but_reduces_duplicate_cluster():
     selected = _mag_diverse_topk(candidates, limit=2, pool_size=3)
 
     assert [item["id"] for item in selected] == ["a", "c"]
+
+
+def test_diverse_topk_deduplicates_candidate_ids():
+    candidates = [
+        {"id": "a", "memory": "John likes basketball jerseys.", "score": 1.0},
+        {"id": "a", "memory": "John likes basketball jerseys duplicate.", "score": 0.99},
+        {"id": "b", "memory": "Tim owns a signed basketball.", "score": 0.9},
+    ]
+
+    selected = _mag_diverse_topk(candidates, limit=3, pool_size=3)
+
+    assert [item["id"] for item in selected] == ["a", "b"]
+
+
+def test_final_context_deduplicates_path_and_support_sentence_ids():
+    final = [
+        {
+            "id": "s2",
+            "memory": "path memory",
+            "created_at": "2023-01-02T00:00:00",
+            "context_segments": [
+                {"id": "s1", "memory": "Alice visited Rome.", "created_at": "2023-01-01T00:00:00"},
+                {"id": "s2", "memory": "Alice bought pasta.", "created_at": "2023-01-02T00:00:00"},
+            ],
+            "supporting_context": [
+                {"id": "s3", "direction": "next", "memory": "Alice cooked pasta.", "created_at": "2023-01-03T00:00:00"},
+            ],
+        },
+        {
+            "id": "s3",
+            "memory": "Alice cooked pasta.",
+            "created_at": "2023-01-03T00:00:00",
+        },
+        {
+            "id": "s4",
+            "memory": "Bob likes tea.",
+            "created_at": "2023-01-04T00:00:00",
+            "supporting_context": [
+                {"id": "s1", "direction": "prev", "memory": "Alice visited Rome.", "created_at": "2023-01-01T00:00:00"},
+            ],
+        },
+    ]
+
+    cleaned = _mag_dedupe_final_context(final)
+
+    assert [item["id"] for item in cleaned] == ["s2", "s4"]
+    joined = "\n".join(item["memory"] for item in cleaned)
+    assert joined.count("Alice visited Rome.") == 1
+    assert joined.count("Alice cooked pasta.") == 1
+    assert "supporting_context" not in cleaned[1]
 
 
 def test_add_source_deduplicates_route_labels():
