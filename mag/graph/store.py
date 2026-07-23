@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 REL_TYPE = "type"
 REL_ORIGINS = "source_sentence_ids"
 REL_SCOPES = "source_sentence_scopes"
+REL_FACT_ORIGINS = "source_fact_memory_ids"
 NODE_SCOPES = "linked_sentence_scopes"
 
 
@@ -269,6 +270,8 @@ class GraphStore:
         session_scope: Optional[str] = None,
         source_fact_id: str = "",
         source_fact: str = "",
+        source_unit_id: str = "",
+        source_fact_memory_id: str = "",
     ):
         """
         添加或更新关系边。
@@ -310,6 +313,8 @@ class GraphStore:
                     "confidence": confidence,
                     "source_fact_id": source_fact_id,
                     "source_fact": source_fact,
+                    "source_unit_id": source_unit_id,
+                    REL_FACT_ORIGINS: [source_fact_memory_id] if source_fact_memory_id else [],
                 },
             )
 
@@ -395,6 +400,8 @@ class GraphStore:
                     "source_sentence_ids": list(edge_data.get(REL_ORIGINS, [])),
                     "source_fact_id": edge_data.get("source_fact_id", ""),
                     "source_fact": edge_data.get("source_fact", ""),
+                    "source_unit_id": edge_data.get("source_unit_id", ""),
+                    "source_fact_memory_ids": list(edge_data.get(REL_FACT_ORIGINS, [])),
                     "direction": "out",
                 })
 
@@ -410,6 +417,8 @@ class GraphStore:
                     "source_sentence_ids": list(edge_data.get(REL_ORIGINS, [])),
                     "source_fact_id": edge_data.get("source_fact_id", ""),
                     "source_fact": edge_data.get("source_fact", ""),
+                    "source_unit_id": edge_data.get("source_unit_id", ""),
+                    "source_fact_memory_ids": list(edge_data.get(REL_FACT_ORIGINS, [])),
                     "direction": "in",
                 })
 

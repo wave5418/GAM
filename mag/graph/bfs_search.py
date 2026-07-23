@@ -293,7 +293,7 @@ class BFSRetriever:
                             if not self.graph_store._edge_matches_scope(edge_data, session_scope):
                                 continue
                             rel = edge_data.get("type", "related")
-                            sids = edge_data.get("source_sentence_ids", [])
+                            sids = edge_data.get("source_fact_memory_ids") or edge_data.get("source_sentence_ids", [])
                             scopes = edge_data.get("source_sentence_scopes", {})
                             scoped_sids = [
                                 sid for sid in sids

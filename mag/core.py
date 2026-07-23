@@ -53,7 +53,7 @@ from mem0.utils.scoring import (
 
 # ── MAG 增强模块 ──
 from mag.evidence_units import EvidenceUnitBuilder
-from mag.schema import EntityWeight
+from mag.schema import EntityWeight, ExtractedFact, Triple
 from mag.segmentation import SentenceSegmenter
 from mag.graph import (
     BFSRetriever,
@@ -583,6 +583,8 @@ def _mag_jaccard(left: Set[str], right: Set[str]) -> float:
 def _mag_add_source(source: str, route: str) -> str:
     """Append a route label once while preserving route order."""
     parts = [part for part in str(source or "").split("+") if part]
+    if not route:
+        return "+".join(parts)
     if route not in parts:
         parts.append(route)
     return "+".join(parts)
@@ -972,6 +974,7 @@ class MAGMemory(MemoryBase):
         self.mag_use_history = linear_rag_config.get("use_history", True) if linear_rag_config else True
         self.mag_use_dedup = linear_rag_config.get("use_dedup", True) if linear_rag_config else True
         self.mag_build_evidence_units = linear_rag_config.get("build_evidence_units", True) if linear_rag_config else True
+        self.mag_index_graph_facts = linear_rag_config.get("index_graph_facts", True) if linear_rag_config else True
         self.mag_use_entity_boost = linear_rag_config is not None and linear_rag_config.get("use_entity_boost", False) if linear_rag_config else False
         self.mag_use_entity_match = linear_rag_config.get("use_entity_match", False) if linear_rag_config else False
         self.mag_use_context_window = linear_rag_config.get("use_context_window", False) if linear_rag_config else False
@@ -2197,6 +2200,8 @@ class MAGMemory(MemoryBase):
 
             if payload.get("_bfs_source"):
                 memory_item_dict["source"] = payload["_bfs_source"]
+            elif payload.get("graph_object") == "edge_fact":
+                memory_item_dict["source"] = "graph_fact"
 
             for key in promoted_payload_keys:
                 if key in payload:
@@ -2823,13 +2828,21 @@ class MAGMemory(MemoryBase):
         triples = self.triple_extractor.extract_triples_direct(items, timestamps=timestamps)
         if not triples:
             return 0, {}
+        fact_memory_ids = self._mag_index_graph_fact_memories(
+            self.triple_extractor.last_extracted_facts,
+            triples,
+            filters or {},
+            session_scope,
+        )
 
         entity_map: Dict[str, Dict[str, EntityWeight]] = {}
         for triple in triples:
             sid = str(triple.source_sentence_id or "")
             if not sid:
                 continue
-            scope = self._mag_session_scope_for_sentence(sid, session_scope)
+            fact_memory_id = fact_memory_ids.get((sid, str(triple.source_fact_id or "")))
+            graph_source_id = fact_memory_id or sid
+            scope = self._mag_session_scope_for_sentence(graph_source_id, session_scope)
             confidence = max(0.1, min(1.0, float(triple.confidence or 0.8)))
             for name in (triple.head, triple.tail):
                 entity_name = str(name or "").strip()
@@ -2845,7 +2858,7 @@ class MAGMemory(MemoryBase):
                 self.graph_store.upsert_entity(
                     entity_name,
                     confidence,
-                    sid,
+                    graph_source_id,
                     "LLM_ENTITY",
                     session_scope=scope,
                 )
@@ -2853,11 +2866,13 @@ class MAGMemory(MemoryBase):
                 triple.head,
                 triple.relation,
                 triple.tail,
-                sid,
+                graph_source_id,
                 confidence,
                 session_scope=scope,
                 source_fact_id=triple.source_fact_id,
                 source_fact=triple.source_fact,
+                source_unit_id=sid,
+                source_fact_memory_id=fact_memory_id or "",
             )
 
         merged_entity_map = {
@@ -2866,6 +2881,126 @@ class MAGMemory(MemoryBase):
         }
         self._mag_update_sentence_entities_from_triples(merged_entity_map, filters or {})
         return len(triples), merged_entity_map
+
+    def _mag_index_graph_fact_memories(
+        self,
+        facts: List[ExtractedFact],
+        triples: List[Triple],
+        filters: Dict[str, Any],
+        session_scope: Optional[str],
+    ) -> Dict[Tuple[str, str], str]:
+        """Store Graphiti-style fact edges as first-class vector-search memories."""
+        if not self.mag_index_graph_facts or not facts:
+            return {}
+
+        facts_by_key: Dict[Tuple[str, str], ExtractedFact] = {}
+        for fact in facts:
+            sid = str(fact.source_sentence_id or "").strip()
+            fid = str(fact.fact_id or "").strip()
+            fact_text = str(fact.fact or "").strip()
+            if sid and fid and fact_text:
+                facts_by_key[(sid, fid)] = fact
+        if not facts_by_key:
+            return {}
+
+        endpoints_by_key: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+        for triple in triples:
+            sid = str(triple.source_sentence_id or "").strip()
+            fid = str(triple.source_fact_id or "").strip()
+            if not sid or not fid:
+                continue
+            endpoints_by_key.setdefault((sid, fid), []).append({
+                "head": str(triple.head or ""),
+                "relation": str(triple.relation or ""),
+                "tail": str(triple.tail or ""),
+            })
+
+        fact_ids: Dict[Tuple[str, str], str] = {}
+        fact_items = list(facts_by_key.items())
+        fact_texts = [fact.fact for _, fact in fact_items]
+        try:
+            embeddings = self.embedding_model.embed_batch(fact_texts, "add")
+        except Exception:
+            embeddings = [self.embedding_model.embed(text, "add") for text in fact_texts]
+
+        import hashlib as _hashlib
+        from mem0.utils.lemmatization import lemmatize_for_bm25 as _lemmatize
+
+        for idx, ((source_sid, source_fact_id), fact) in enumerate(fact_items):
+            source_payload = self._mag_get_scoped_payload(source_sid, filters)
+            if source_payload is None:
+                continue
+            created_at = str(source_payload.get("created_at", ""))
+            updated_at = str(source_payload.get("updated_at", created_at))
+            fact_memory_id = str(uuid.uuid4())
+            scope = self._mag_session_scope_for_sentence(source_sid, session_scope)
+            self._mag_sentence_scopes[fact_memory_id] = scope
+            endpoint_triples = endpoints_by_key.get((source_sid, source_fact_id), [])
+            entity_names = []
+            for triple_info in endpoint_triples:
+                for key in ("head", "tail"):
+                    name = str(triple_info.get(key, "")).strip()
+                    if name and name.lower() not in {existing.lower() for existing in entity_names}:
+                        entity_names.append(name)
+            entities = [
+                {
+                    "name": name,
+                    "attention_weight": max(0.1, min(1.0, float(fact.confidence or 0.8))),
+                    "entity_type": "LLM_ENTITY",
+                }
+                for name in entity_names
+            ]
+            fact_hash = _hashlib.md5(
+                f"graph_fact:{source_sid}:{source_fact_id}:{fact.fact}".encode()
+            ).hexdigest()
+            payload = {
+                "data": fact.fact,
+                "hash": fact_hash,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "sentence_id": fact_memory_id,
+                "speaker": source_payload.get("speaker", ""),
+                "text_lemmatized": _lemmatize(fact.fact),
+                "entities": entities,
+                "graph_object": "edge_fact",
+                "fact": fact.fact,
+                "edge_fact": fact.fact,
+                "source_fact_id": source_fact_id,
+                "source_unit_id": source_sid,
+                "source_unit_text": source_payload.get("data", ""),
+                "source_raw_sentence_ids": source_payload.get("source_raw_sentence_ids", []),
+                "source_raw_texts": source_payload.get("source_raw_texts", []),
+                "valid_at": created_at,
+                "invalid_at": "",
+                "edge_type": endpoint_triples[0].get("relation", "") if endpoint_triples else "",
+                "triples": endpoint_triples,
+                "unit_confidence": max(0.0, min(1.0, float(fact.confidence or 1.0))),
+                **{key: value for key, value in source_payload.items() if key in ("user_id", "agent_id", "run_id", "actor_id", "role")},
+                _MAG_KEY: "fact",
+            }
+            try:
+                self.vector_store.insert(
+                    vectors=[embeddings[idx]],
+                    ids=[fact_memory_id],
+                    payloads=[payload],
+                )
+            except Exception as exc:
+                logger.warning("MAG graph fact insert failed: %s", str(exc)[:120])
+                continue
+            if self.mag_use_history:
+                try:
+                    self.db.add_history(
+                        fact_memory_id,
+                        None,
+                        fact.fact,
+                        "ADD",
+                        created_at=created_at,
+                        is_deleted=0,
+                    )
+                except Exception:
+                    pass
+            fact_ids[(source_sid, source_fact_id)] = fact_memory_id
+        return fact_ids
 
     def _mag_timestamps_for_items(self, items: List[Tuple[str, str]]) -> Dict[str, str]:
         timestamps: Dict[str, str] = {}
@@ -3210,6 +3345,7 @@ class MAGMemory(MemoryBase):
                     "created_at": r.get("created_at", ""),
                     "entities": r.get("metadata", {}).get("entities", []) if isinstance(r.get("metadata"), dict) else [],
                     "metadata": r.get("metadata", {}) if isinstance(r.get("metadata"), dict) else {},
+                    "source": r.get("source", ""),
                 }
         route_debug["validator_candidates"] = len(validator_map)
         _mark_timing("validator_materialize")
@@ -3344,6 +3480,19 @@ class MAGMemory(MemoryBase):
                         },
                         "graph_path": path_info.get("path", []),
                         "context_segments": context_segments,
+                        "metadata": {
+                            key: scoped_payloads[-1][1].get(key)
+                            for key in (
+                                "graph_object",
+                                "fact",
+                                "valid_at",
+                                "invalid_at",
+                                "source_unit_id",
+                                "edge_type",
+                                "triples",
+                            )
+                            if scoped_payloads[-1][1].get(key) not in (None, "", [])
+                        },
                     }
                     gate = _mag_bfs_shadow_gate(
                         query,
@@ -3378,13 +3527,17 @@ class MAGMemory(MemoryBase):
         validator_pool_limit = max(limit * 4, 60)
         for rid, v in list(validator_map.items())[:validator_pool_limit]:
             validator_score = v.get("score", 0)
+            validator_source = "vector+bm25_validator"
+            if v.get("source") == "graph_fact" or v.get("metadata", {}).get("graph_object") == "edge_fact":
+                validator_source = _mag_add_source(validator_source, "graph_fact")
             merged_map[rid] = {
                 "id": rid,
                 "memory": v.get("memory", ""),
                 "score": validator_score,
                 "created_at": v.get("created_at", ""),
-                "source": "vector+bm25_validator",
+                "source": validator_source,
                 "entities": v.get("entities", []),
+                "metadata": dict(v.get("metadata", {})),
                 "route_scores": {
                     "graph": 0.0,
                     "validator": round(validator_score, 4),
@@ -3427,8 +3580,12 @@ class MAGMemory(MemoryBase):
                     "memory": v.get("memory", ""),
                     "score": v.get("score", 0) * 0.55,
                     "created_at": v.get("created_at", ""),
-                    "source": "vector+bm25_fallback",
+                    "source": _mag_add_source(
+                        "vector+bm25_fallback",
+                        "graph_fact" if v.get("source") == "graph_fact" or v.get("metadata", {}).get("graph_object") == "edge_fact" else "",
+                    ),
                     "entities": v.get("entities", []),
+                    "metadata": dict(v.get("metadata", {})),
                     "route_scores": {
                         "graph": 0.0,
                         "validator": round(v.get("score", 0), 4),

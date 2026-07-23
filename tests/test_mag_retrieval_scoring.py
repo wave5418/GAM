@@ -157,6 +157,7 @@ def test_final_context_deduplicates_path_and_support_sentence_ids():
 def test_add_source_deduplicates_route_labels():
     assert _mag_add_source("vector+bm25_validator+graph_bfs", "graph_bfs") == "vector+bm25_validator+graph_bfs"
     assert _mag_add_source("vector+bm25_validator", "ctx_boost") == "vector+bm25_validator+ctx_boost"
+    assert _mag_add_source("vector+bm25_fallback", "") == "vector+bm25_fallback"
 
 
 def test_format_search_results_preserves_mag_metadata():

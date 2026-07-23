@@ -100,3 +100,51 @@ def test_graph_store_preserves_source_fact_metadata():
     assert len(relations) == 1
     assert relations[0]["source_fact_id"] == "f1"
     assert relations[0]["source_fact"] == "Alice painted sunsets."
+
+
+def test_graph_store_preserves_graphiti_fact_memory_ids():
+    graph = GraphStore()
+    graph.add_relation(
+        "Alice",
+        "painted",
+        "sunsets",
+        "fact_1",
+        confidence=0.9,
+        session_scope="user_id=a",
+        source_fact_id="f1",
+        source_fact="Alice painted sunsets.",
+        source_unit_id="unit_1",
+        source_fact_memory_id="fact_1",
+    )
+
+    relations = graph.get_all_relations_for_entity("alice", session_scope="user_id=a")
+
+    assert relations[0]["source_sentence_ids"] == ["fact_1"]
+    assert relations[0]["source_fact_memory_ids"] == ["fact_1"]
+    assert relations[0]["source_unit_id"] == "unit_1"
+
+
+def test_path_search_prefers_fact_memory_ids_on_edges():
+    graph = GraphStore()
+    graph.add_relation(
+        "Alice",
+        "painted",
+        "sunsets",
+        "unit_1",
+        confidence=0.9,
+        session_scope="user_id=a",
+        source_fact_memory_id="fact_1",
+    )
+
+    bfs = BFSRetriever(graph)
+    paths = bfs.search_paths(
+        [EntityWeight(name="alice", attention_weight=1.0, entity_type="PERSON")],
+        query_embedding=None,
+        get_semantic_sim=lambda identifier: 1.0 if identifier == "Alice painted sunsets" else 0.0,
+        max_hops=1,
+        max_results=10,
+        session_scope="user_id=a",
+    )
+
+    source_ids = {sid for path in paths for sid in path["sentences"]}
+    assert source_ids == {"fact_1"}

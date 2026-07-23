@@ -107,6 +107,9 @@ class MAGConfig:
     # Evidence Unit 构建 — LLM 合并相邻句并消解明确指代，只存合成后的 unit
     build_evidence_units: bool = True
 
+    # Graphiti-style fact edges — 将抽取出的 atomic facts 作为一等检索对象写入索引
+    index_graph_facts: bool = True
+
     # 上下文窗口 — 检索时每个候选句附带前后各一句
     use_context_window: bool = False
 
@@ -181,6 +184,7 @@ class MAGConfig:
             use_history=_bool("USE_HISTORY", True),
             use_dedup=_bool("USE_DEDUP", True),
             build_evidence_units=_bool("BUILD_EVIDENCE_UNITS", True),
+            index_graph_facts=_bool("INDEX_GRAPH_FACTS", True),
             use_context_window=_bool("USE_CONTEXT_WINDOW", False),
             bm25_weight=_float("BM25_WEIGHT", 1.0),
             linear_rag_enabled=_bool("LINEARRAG", False),
@@ -263,6 +267,7 @@ class MAGConfig:
             "use_history": self.use_history,
             "use_dedup": self.use_dedup,
             "build_evidence_units": self.build_evidence_units,
+            "index_graph_facts": self.index_graph_facts,
             "use_context_window": self.use_context_window,
             "bm25_weight": self.bm25_weight,
             "quality_threshold": self.linear_rag_quality_threshold,
@@ -290,6 +295,7 @@ class MAGConfig:
             "history": self.use_history,
             "dedup": self.use_dedup,
             "evidence_units": self.build_evidence_units,
+            "graph_facts": self.index_graph_facts,
             "context_window": self.use_context_window,
             "bm25_weight": self.bm25_weight,
         }
