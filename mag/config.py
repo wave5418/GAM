@@ -116,6 +116,9 @@ class MAGConfig:
     # 上下文窗口 — 检索时每个候选句附带前后各一句
     use_context_window: bool = False
 
+    # 建图上下文窗口 — fact/triple 抽取时使用最近 N 个已摄入 unit 做指代消解
+    graph_context_window: int = 4
+
     # BM25 权重 — 降低到 < 1.0 可减少短句噪声
     bm25_weight: float = 1.0
 
@@ -190,6 +193,7 @@ class MAGConfig:
             index_graph_facts=_bool("INDEX_GRAPH_FACTS", True),
             index_entity_summaries=_bool("INDEX_ENTITY_SUMMARIES", True),
             use_context_window=_bool("USE_CONTEXT_WINDOW", False),
+            graph_context_window=_int("GRAPH_CONTEXT_WINDOW", 4),
             bm25_weight=_float("BM25_WEIGHT", 1.0),
             linear_rag_enabled=_bool("LINEARRAG", False),
             linear_rag_quality_threshold=_float("QUALITY_THRESHOLD", 0.3),
@@ -274,6 +278,7 @@ class MAGConfig:
             "index_graph_facts": self.index_graph_facts,
             "index_entity_summaries": self.index_entity_summaries,
             "use_context_window": self.use_context_window,
+            "graph_context_window": self.graph_context_window,
             "bm25_weight": self.bm25_weight,
             "quality_threshold": self.linear_rag_quality_threshold,
             "max_supplement_rounds": self.linear_rag_max_supplement_rounds,
@@ -303,5 +308,6 @@ class MAGConfig:
             "graph_facts": self.index_graph_facts,
             "entity_summaries": self.index_entity_summaries,
             "context_window": self.use_context_window,
+            "graph_context_window": self.graph_context_window,
             "bm25_weight": self.bm25_weight,
         }

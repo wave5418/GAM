@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 import warnings
+from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -976,6 +977,7 @@ class MAGMemory(MemoryBase):
         self.mag_build_evidence_units = linear_rag_config.get("build_evidence_units", True) if linear_rag_config else True
         self.mag_index_graph_facts = linear_rag_config.get("index_graph_facts", True) if linear_rag_config else True
         self.mag_index_entity_summaries = linear_rag_config.get("index_entity_summaries", True) if linear_rag_config else True
+        self.mag_graph_context_window = linear_rag_config.get("graph_context_window", 4) if linear_rag_config else 4
         self.mag_use_entity_boost = linear_rag_config is not None and linear_rag_config.get("use_entity_boost", False) if linear_rag_config else False
         self.mag_use_entity_match = linear_rag_config.get("use_entity_match", False) if linear_rag_config else False
         self.mag_use_context_window = linear_rag_config.get("use_context_window", False) if linear_rag_config else False
@@ -988,6 +990,7 @@ class MAGMemory(MemoryBase):
         self._pending_edge_entity_count: int = 0
         self._pending_uid: str = ""  # 跟踪当前积累的 user_id，跨对话自动 flush
         self._mag_sentence_scopes: Dict[str, str] = {}
+        self._mag_recent_graph_units: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
         self._graph_path = (graph_config or {}).get("persist_path", "/tmp/mag_graph.json")
         self._graph_save_lock = threading.Lock()
 
@@ -2587,6 +2590,10 @@ class MAGMemory(MemoryBase):
         raw_sentences = self.segmenter.segment(messages, default_timestamp=default_timestamp)
         if not raw_sentences:
             return []
+        graph_context_items = self._mag_get_graph_context_items(
+            session_scope,
+            default_timestamp=default_timestamp,
+        )
         if self.mag_build_evidence_units:
             evidence_units = self.evidence_unit_builder.build(raw_sentences)
         else:
@@ -2709,10 +2716,22 @@ class MAGMemory(MemoryBase):
                     items,
                     session_scope=session_scope,
                     filters=filters,
+                    context_items=graph_context_items,
                 )
                 for i, sid in enumerate(sentence_ids):
                     if sid in entity_map:
                         filtered_ew[i] = entity_map[sid]
+
+        self._mag_update_graph_context(session_scope, [
+            (sid, sentence_texts[filtered_idx[i]])
+            for i, sid in enumerate(sentence_ids)
+            if sentence_texts[filtered_idx[i]].strip()
+        ])
+        if self.mag_use_history:
+            try:
+                self.db.save_messages(messages, session_scope)
+            except Exception:
+                pass
 
         # S5+S6 完后保存图到磁盘
         self._graph_save()
@@ -2817,18 +2836,76 @@ class MAGMemory(MemoryBase):
         """公开接口：强制 flush 积累的边候选句（session 边界等场景调用）。"""
         self._flush_edge_sentences()
 
+    def _mag_get_graph_context_items(
+        self,
+        session_scope: str,
+        default_timestamp: datetime = None,
+    ) -> List[Tuple[str, str]]:
+        """Return recent evidence units for graph extraction reference resolution."""
+        try:
+            limit = int(self.mag_graph_context_window or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit <= 0 or not session_scope:
+            return []
+
+        recent = list(self._mag_recent_graph_units.get(session_scope, []))[-limit:]
+        if recent:
+            return recent
+
+        try:
+            last_messages = self.db.get_last_messages(session_scope, limit=limit)
+        except Exception:
+            return []
+        if not last_messages:
+            return []
+        try:
+            raw_context = self.segmenter.segment(last_messages, default_timestamp=default_timestamp)
+        except Exception:
+            return []
+        context_items: List[Tuple[str, str]] = []
+        for idx, (text, _speaker, _timestamp) in enumerate(raw_context[-limit:]):
+            text = str(text or "").strip()
+            if text:
+                context_items.append((f"ctx_{idx}", text))
+        return context_items
+
+    def _mag_update_graph_context(self, session_scope: str, items: List[Tuple[str, str]]) -> None:
+        """Append current evidence units to the per-session graph extraction context."""
+        if not session_scope or not items:
+            return
+        try:
+            limit = max(0, int(self.mag_graph_context_window or 0))
+        except (TypeError, ValueError):
+            limit = 0
+        if limit <= 0:
+            return
+        bucket = self._mag_recent_graph_units.setdefault(session_scope, [])
+        for sid, text in items:
+            sid_text = str(sid or "").strip()
+            memory_text = str(text or "").strip()
+            if sid_text and memory_text:
+                bucket.append((sid_text, memory_text))
+        if len(bucket) > limit:
+            del bucket[:-limit]
+
     def _mag_index_direct_triples(
         self,
         items: List[Tuple[str, str]],
         session_scope: Optional[str],
         filters: Optional[Dict[str, Any]] = None,
+        context_items: Optional[List[Tuple[str, str]]] = None,
     ) -> Tuple[int, Dict[str, List[EntityWeight]]]:
         """Extract LLM triples and write graph nodes/edges using sentence ids."""
         if not items:
             return 0, {}
 
-        timestamps = self._mag_timestamps_for_items(items)
-        triples = self.triple_extractor.extract_triples_direct(items, timestamps=timestamps)
+        timestamps = self._mag_timestamps_for_items(items + list(context_items or []))
+        triples = self.triple_extractor.extract_triples_direct(
+            items,
+            timestamps=timestamps,
+            context_items=context_items,
+        )
         if not triples:
             return 0, {}
         fact_memory_ids = self._mag_index_graph_fact_memories(
@@ -2922,6 +2999,7 @@ class MAGMemory(MemoryBase):
                 "head": str(triple.head or ""),
                 "relation": str(triple.relation or ""),
                 "tail": str(triple.tail or ""),
+                "source_sentence_ids": list(triple.source_sentence_ids or [sid]),
             })
 
         fact_ids: Dict[Tuple[str, str], str] = {}
@@ -2939,6 +3017,30 @@ class MAGMemory(MemoryBase):
             source_payload = self._mag_get_scoped_payload(source_sid, filters)
             if source_payload is None:
                 continue
+            source_unit_ids = list(fact.source_sentence_ids or [source_sid])
+            if source_sid not in source_unit_ids:
+                source_unit_ids.insert(0, source_sid)
+            source_payloads: Dict[str, Dict[str, Any]] = {source_sid: source_payload}
+            for source_unit_id in source_unit_ids:
+                if source_unit_id in source_payloads:
+                    continue
+                payload = self._mag_get_scoped_payload(source_unit_id, filters)
+                if payload is not None:
+                    source_payloads[source_unit_id] = payload
+            source_unit_texts = [
+                str(source_payloads.get(source_unit_id, {}).get("data", ""))
+                for source_unit_id in source_unit_ids
+            ]
+            source_raw_sentence_ids = []
+            source_raw_texts = []
+            for source_unit_id in source_unit_ids:
+                payload = source_payloads.get(source_unit_id, {})
+                for raw_sid in payload.get("source_raw_sentence_ids", []):
+                    if raw_sid not in source_raw_sentence_ids:
+                        source_raw_sentence_ids.append(raw_sid)
+                for raw_text in payload.get("source_raw_texts", []):
+                    if raw_text not in source_raw_texts:
+                        source_raw_texts.append(raw_text)
             created_at = str(source_payload.get("created_at", ""))
             updated_at = str(source_payload.get("updated_at", created_at))
             fact_memory_id = str(uuid.uuid4())
@@ -2960,7 +3062,7 @@ class MAGMemory(MemoryBase):
                 for name in entity_names
             ]
             fact_hash = _hashlib.md5(
-                f"graph_fact:{source_sid}:{source_fact_id}:{fact.fact}".encode()
+                f"graph_fact:{','.join(source_unit_ids)}:{source_fact_id}:{fact.fact}".encode()
             ).hexdigest()
             payload = {
                 "data": fact.fact,
@@ -2976,9 +3078,11 @@ class MAGMemory(MemoryBase):
                 "edge_fact": fact.fact,
                 "source_fact_id": source_fact_id,
                 "source_unit_id": source_sid,
+                "source_unit_ids": source_unit_ids,
                 "source_unit_text": source_payload.get("data", ""),
-                "source_raw_sentence_ids": source_payload.get("source_raw_sentence_ids", []),
-                "source_raw_texts": source_payload.get("source_raw_texts", []),
+                "source_unit_texts": source_unit_texts,
+                "source_raw_sentence_ids": source_raw_sentence_ids,
+                "source_raw_texts": source_raw_texts,
                 "valid_at": created_at,
                 "invalid_at": "",
                 "edge_type": endpoint_triples[0].get("relation", "") if endpoint_triples else "",

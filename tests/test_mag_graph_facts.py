@@ -29,10 +29,21 @@ class FakeVectorStore:
             "source_raw_sentence_ids": ["s0", "s1"],
             "source_raw_texts": ["Alice painted sunsets.", "She loved it."],
         }
+        self.context_payload = {
+            "data": "Bob asked what Alice painted.",
+            "created_at": "2023-07-01T00:00:00+00:00",
+            "updated_at": "2023-07-01T00:00:00+00:00",
+            "speaker": "assistant",
+            "user_id": "u1",
+            "source_raw_sentence_ids": ["c0"],
+            "source_raw_texts": ["Bob asked what Alice painted."],
+        }
 
     def get(self, vector_id):
         if vector_id == "unit_1":
             return FakeRecord(self.source_payload)
+        if vector_id == "unit_ctx":
+            return FakeRecord(self.context_payload)
         if vector_id in self.records:
             return FakeRecord(self.records[vector_id])
         return None
@@ -102,7 +113,12 @@ def test_mag_indexes_extracted_facts_as_graphiti_style_memories():
     assert payload["source_unit_id"] == "unit_1"
     assert payload["valid_at"] == "2023-07-01T00:00:00+00:00"
     assert payload["invalid_at"] == ""
-    assert payload["triples"] == [{"head": "Alice", "relation": "painted", "tail": "sunsets"}]
+    assert payload["triples"] == [{
+        "head": "Alice",
+        "relation": "painted",
+        "tail": "sunsets",
+        "source_sentence_ids": ["unit_1"],
+    }]
     assert payload["user_id"] == "u1"
     assert memory._mag_sentence_scopes[fact_memory_id] == "user_id=u1"
     assert {payload["entity_name"] for payload in entity_payloads} == {"Alice", "sunsets"}
@@ -138,4 +154,49 @@ def test_mag_entity_summary_memory_updates_existing_node():
     payload = memory.vector_store.updated[0]["payload"]
     assert payload["graph_object"] == "entity_node"
     assert payload["summary_facts"] == ["Alice painted sunsets.", "Alice bought a camera."]
-    assert payload["source_fact_memory_ids"] == ["fact_1", "fact_2"]
+
+
+def test_mag_graph_fact_memory_preserves_multi_source_units():
+    memory = object.__new__(MAGMemory)
+    memory.mag_index_graph_facts = True
+    memory.mag_index_entity_summaries = False
+    memory.mag_use_history = False
+    memory.embedding_model = FakeEmbeddingModel()
+    memory.vector_store = FakeVectorStore()
+    memory.db = FakeDB()
+    memory._mag_sentence_scopes = {"unit_1": "user_id=u1", "unit_ctx": "user_id=u1"}
+
+    memory._mag_index_graph_fact_memories(
+        [
+            ExtractedFact(
+                fact_id="f1",
+                fact="Alice painted sunsets.",
+                source_sentence_id="unit_1",
+                source_sentence_ids=["unit_ctx", "unit_1"],
+                confidence=0.9,
+            )
+        ],
+        [
+            Triple(
+                head="Alice",
+                relation="painted",
+                tail="sunsets",
+                source_sentence_id="unit_1",
+                source_sentence_ids=["unit_ctx", "unit_1"],
+                source_fact_id="f1",
+                source_fact="Alice painted sunsets.",
+                confidence=0.9,
+            )
+        ],
+        {"user_id": "u1"},
+        "user_id=u1",
+    )
+
+    payload = memory.vector_store.inserted[0]["payloads"][0]
+    assert payload["source_unit_id"] == "unit_1"
+    assert payload["source_unit_ids"] == ["unit_ctx", "unit_1"]
+    assert payload["source_unit_texts"] == [
+        "Bob asked what Alice painted.",
+        "Alice painted sunsets. She loved it.",
+    ]
+    assert payload["source_raw_sentence_ids"] == ["c0", "s0", "s1"]

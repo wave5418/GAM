@@ -57,12 +57,20 @@ class ExtractedFact:
     fact: str
     source_sentence_id: str
     confidence: float = 1.0
+    source_sentence_ids: List[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.source_sentence_ids and self.source_sentence_id:
+            self.source_sentence_ids = [self.source_sentence_id]
+        elif self.source_sentence_id and self.source_sentence_id not in self.source_sentence_ids:
+            self.source_sentence_ids = [self.source_sentence_id, *self.source_sentence_ids]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "fact_id": self.fact_id,
             "fact": self.fact,
             "source_sentence_id": self.source_sentence_id,
+            "source_sentence_ids": list(self.source_sentence_ids),
             "confidence": self.confidence,
         }
 
@@ -72,6 +80,7 @@ class ExtractedFact:
             fact_id=d["fact_id"],
             fact=d["fact"],
             source_sentence_id=d.get("source_sentence_id", ""),
+            source_sentence_ids=list(d.get("source_sentence_ids", []) or []),
             confidence=d.get("confidence", 1.0),
         )
 
@@ -87,6 +96,13 @@ class Triple:
     source_sentence_id: str = ""  # ★ 反向引用到原始句子
     source_fact_id: str = ""  # optional: 反向引用到中间 atomic fact
     source_fact: str = ""  # optional: 中间 fact 文本，便于调试
+    source_sentence_ids: List[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.source_sentence_ids and self.source_sentence_id:
+            self.source_sentence_ids = [self.source_sentence_id]
+        elif self.source_sentence_id and self.source_sentence_id not in self.source_sentence_ids:
+            self.source_sentence_ids = [self.source_sentence_id, *self.source_sentence_ids]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -95,6 +111,7 @@ class Triple:
             "tail": self.tail,
             "confidence": self.confidence,
             "source_sentence_id": self.source_sentence_id,
+            "source_sentence_ids": list(self.source_sentence_ids),
             "source_fact_id": self.source_fact_id,
             "source_fact": self.source_fact,
         }
@@ -107,6 +124,7 @@ class Triple:
             tail=d["tail"],
             confidence=d.get("confidence", 1.0),
             source_sentence_id=d.get("source_sentence_id", ""),
+            source_sentence_ids=list(d.get("source_sentence_ids", []) or []),
             source_fact_id=d.get("source_fact_id", ""),
             source_fact=d.get("source_fact", ""),
         )

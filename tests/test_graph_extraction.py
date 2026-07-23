@@ -97,6 +97,63 @@ def test_direct_triple_extraction_uses_source_facts():
     assert triples[0].source_fact == "Alice painted sunsets."
 
 
+def test_direct_triple_extraction_uses_context_without_extracting_context_facts():
+    detector = DirectTripleExtractor(
+        llm_client=FakeLLM({
+            "facts": [
+                {
+                    "fact_id": "f_ctx",
+                    "source_sentence_id": "ctx1",
+                    "fact": "Caroline asked which concert Melanie attended.",
+                    "confidence": 0.9,
+                },
+                {
+                    "fact_id": "f1",
+                    "source_sentence_id": "s1",
+                    "source_sentence_ids": ["ctx0", "ctx1", "s1"],
+                    "fact": "Melanie attended a concert featuring Matt Patterson.",
+                    "confidence": 0.9,
+                },
+            ],
+            "triples": [
+                {
+                    "head": "Melanie",
+                    "relation": "attended concert featuring",
+                    "tail": "Matt Patterson",
+                    "source_fact_id": "f1",
+                    "source_sentence_id": "s1",
+                    "source_sentence_ids": ["ctx0", "ctx1", "s1"],
+                    "confidence": 0.9,
+                },
+                {
+                    "head": "Caroline",
+                    "relation": "asked about",
+                    "tail": "concert",
+                    "source_fact_id": "f_ctx",
+                    "source_sentence_id": "ctx1",
+                    "confidence": 0.9,
+                },
+            ],
+        })
+    )
+
+    triples = detector.extract_triples_direct(
+        [("s1", "Melanie: It was Matt Patterson.")],
+        context_items=[
+            ("ctx0", "Melanie: I celebrated my daughter's birthday with a concert."),
+            ("ctx1", "Caroline: What concert was it?"),
+        ],
+    )
+
+    assert len(detector.last_extracted_facts) == 1
+    assert detector.last_extracted_facts[0].source_sentence_id == "s1"
+    assert detector.last_extracted_facts[0].source_sentence_ids == ["ctx0", "ctx1", "s1"]
+    assert len(triples) == 1
+    assert triples[0].head == "Melanie"
+    assert triples[0].tail == "Matt Patterson"
+    assert triples[0].source_sentence_ids == ["ctx0", "ctx1", "s1"]
+
+
 def test_direct_triple_extraction_retries_truncated_batch_by_splitting():
     detector = DirectTripleExtractor(
         llm_client=SequenceLLM(
