@@ -52,6 +52,7 @@ from mem0.utils.scoring import (
 )
 
 # ── MAG 增强模块 ──
+from mag.evidence_units import EvidenceUnitBuilder
 from mag.schema import EntityWeight
 from mag.segmentation import SentenceSegmenter
 from mag.graph import (
@@ -970,6 +971,7 @@ class MAGMemory(MemoryBase):
         self.mag_use_entity_store = linear_rag_config.get("use_entity_store", True) if linear_rag_config else True
         self.mag_use_history = linear_rag_config.get("use_history", True) if linear_rag_config else True
         self.mag_use_dedup = linear_rag_config.get("use_dedup", True) if linear_rag_config else True
+        self.mag_build_evidence_units = linear_rag_config.get("build_evidence_units", True) if linear_rag_config else True
         self.mag_use_entity_boost = linear_rag_config is not None and linear_rag_config.get("use_entity_boost", False) if linear_rag_config else False
         self.mag_use_entity_match = linear_rag_config.get("use_entity_match", False) if linear_rag_config else False
         self.mag_use_context_window = linear_rag_config.get("use_context_window", False) if linear_rag_config else False
@@ -988,6 +990,7 @@ class MAGMemory(MemoryBase):
         if mag_enabled:
             llm = self.llm
             self.segmenter = SentenceSegmenter(strategy=segmentation_strategy, llm_client=llm)
+            self.evidence_unit_builder = EvidenceUnitBuilder(llm_client=llm)
             self.triple_extractor = DirectTripleExtractor(llm_client=llm)
             self.graph_store = GraphStore(graph_config or {})
             self.bfs_retriever = BFSRetriever(self.graph_store)
@@ -2573,10 +2576,17 @@ class MAGMemory(MemoryBase):
         from mem0.utils.lemmatization import lemmatize_for_bm25 as _lemmatize
 
         session_scope = _build_session_scope(filters)
-        sentences = self.segmenter.segment(messages, default_timestamp=default_timestamp)
-        if not sentences:
+        raw_sentences = self.segmenter.segment(messages, default_timestamp=default_timestamp)
+        if not raw_sentences:
             return []
-        sentence_texts = [s[0] for s in sentences]
+        if self.mag_build_evidence_units:
+            evidence_units = self.evidence_unit_builder.build(raw_sentences)
+        else:
+            evidence_units = self.evidence_unit_builder.raw_units(raw_sentences)
+        if not evidence_units:
+            return []
+        sentences = [(unit.text, unit.speaker, unit.timestamp) for unit in evidence_units]
+        sentence_texts = [unit.text for unit in evidence_units]
 
         all_ew: List[List[EntityWeight]] = [[] for _ in sentence_texts]
 
@@ -2606,6 +2616,7 @@ class MAGMemory(MemoryBase):
             self._mag_sentence_scopes[sid] = session_scope
             filtered_ew.append(all_ew[i])  # 对齐: 跳过 dedup/merge 后保持索引一致
             filtered_idx.append(i)  # 记录原始索引
+            unit = evidence_units[i]
             # 标准化 Schema: [ID] [Timestamp] [Entities] [RawText]
             payload = {
                 "data": text,
@@ -2616,6 +2627,15 @@ class MAGMemory(MemoryBase):
                 "speaker": speaker,
                 "text_lemmatized": _lemmatize(text),
                 "hash": mem_hash,
+                "evidence_unit": self.mag_build_evidence_units,
+                "source_raw_sentence_ids": list(unit.source_sentence_ids),
+                "source_raw_texts": list(unit.source_texts),
+                "source_speakers": list(unit.source_speakers),
+                "source_timestamps": list(unit.source_timestamps),
+                "resolved_references": list(unit.resolved_references),
+                "unresolved_references": list(unit.unresolved_references),
+                "merge_reason": unit.merge_reason,
+                "unit_confidence": unit.confidence,
                 **mag_meta,
             }
             try:
