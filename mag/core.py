@@ -975,6 +975,7 @@ class MAGMemory(MemoryBase):
         self.mag_use_dedup = linear_rag_config.get("use_dedup", True) if linear_rag_config else True
         self.mag_build_evidence_units = linear_rag_config.get("build_evidence_units", True) if linear_rag_config else True
         self.mag_index_graph_facts = linear_rag_config.get("index_graph_facts", True) if linear_rag_config else True
+        self.mag_index_entity_summaries = linear_rag_config.get("index_entity_summaries", True) if linear_rag_config else True
         self.mag_use_entity_boost = linear_rag_config is not None and linear_rag_config.get("use_entity_boost", False) if linear_rag_config else False
         self.mag_use_entity_match = linear_rag_config.get("use_entity_match", False) if linear_rag_config else False
         self.mag_use_context_window = linear_rag_config.get("use_context_window", False) if linear_rag_config else False
@@ -2202,6 +2203,8 @@ class MAGMemory(MemoryBase):
                 memory_item_dict["source"] = payload["_bfs_source"]
             elif payload.get("graph_object") == "edge_fact":
                 memory_item_dict["source"] = "graph_fact"
+            elif payload.get("graph_object") == "entity_node":
+                memory_item_dict["source"] = "graph_entity"
 
             for key in promoted_payload_keys:
                 if key in payload:
@@ -2862,6 +2865,12 @@ class MAGMemory(MemoryBase):
                     "LLM_ENTITY",
                     session_scope=scope,
                 )
+                if triple.source_fact:
+                    self.graph_store.append_entity_summary_fact(
+                        entity_name,
+                        triple.source_fact,
+                        source_id=graph_source_id,
+                    )
             self.graph_store.add_relation(
                 triple.head,
                 triple.relation,
@@ -3000,7 +3009,97 @@ class MAGMemory(MemoryBase):
                 except Exception:
                     pass
             fact_ids[(source_sid, source_fact_id)] = fact_memory_id
+            for entity_name in entity_names:
+                self._mag_upsert_entity_summary_memory(
+                    entity_name,
+                    fact.fact,
+                    fact_memory_id,
+                    created_at,
+                    source_payload,
+                    scope,
+                    confidence=max(0.1, min(1.0, float(fact.confidence or 0.8))),
+                )
         return fact_ids
+
+    def _mag_upsert_entity_summary_memory(
+        self,
+        entity_name: str,
+        fact_text: str,
+        fact_memory_id: str,
+        created_at: str,
+        source_payload: Dict[str, Any],
+        session_scope: Optional[str],
+        confidence: float = 0.8,
+    ) -> None:
+        """Maintain searchable Graphiti-style entity node summaries."""
+        if not self.mag_index_entity_summaries:
+            return
+        name = str(entity_name or "").strip()
+        fact = str(fact_text or "").strip()
+        if not name or not fact:
+            return
+
+        entity_memory_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"mag_entity:{session_scope or ''}:{name.lower()}"))
+        existing_payload: Dict[str, Any] = {}
+        try:
+            existing = self.vector_store.get(vector_id=entity_memory_id)
+            if existing and hasattr(existing, "payload") and isinstance(existing.payload, dict):
+                existing_payload = dict(existing.payload)
+        except Exception:
+            existing_payload = {}
+
+        summary_facts = list(existing_payload.get("summary_facts", []))
+        if fact not in summary_facts:
+            summary_facts.append(fact)
+        summary_facts = [str(item) for item in summary_facts if str(item).strip()][-20:]
+        summary = f"{name}:\n" + "\n".join(summary_facts)
+        source_fact_ids = list(existing_payload.get("source_fact_memory_ids", []))
+        if fact_memory_id and fact_memory_id not in source_fact_ids:
+            source_fact_ids.append(fact_memory_id)
+        source_fact_ids = source_fact_ids[-20:]
+
+        try:
+            embedding = self.embedding_model.embed(summary, "update" if existing_payload else "add")
+        except Exception:
+            return
+
+        payload = {
+            "data": summary,
+            "hash": hashlib.md5(f"entity_summary:{session_scope}:{name}:{summary}".encode()).hexdigest(),
+            "created_at": existing_payload.get("created_at") or created_at,
+            "updated_at": created_at,
+            "sentence_id": entity_memory_id,
+            "speaker": source_payload.get("speaker", ""),
+            "text_lemmatized": lemmatize_for_bm25(summary),
+            "entities": [{
+                "name": name,
+                "attention_weight": max(0.1, min(1.0, confidence)),
+                "entity_type": "LLM_ENTITY",
+            }],
+            "graph_object": "entity_node",
+            "entity_name": name,
+            "entity_summary": summary,
+            "summary_facts": summary_facts,
+            "source_fact_memory_ids": source_fact_ids,
+            **{key: value for key, value in source_payload.items() if key in ("user_id", "agent_id", "run_id", "actor_id", "role")},
+            _MAG_KEY: "entity",
+        }
+        self._mag_sentence_scopes[entity_memory_id] = session_scope or ""
+        try:
+            if existing_payload:
+                self.vector_store.update(
+                    vector_id=entity_memory_id,
+                    vector=embedding,
+                    payload=payload,
+                )
+            else:
+                self.vector_store.insert(
+                    vectors=[embedding],
+                    ids=[entity_memory_id],
+                    payloads=[payload],
+                )
+        except Exception as exc:
+            logger.debug("MAG entity summary upsert failed: %s", str(exc)[:120])
 
     def _mag_timestamps_for_items(self, items: List[Tuple[str, str]]) -> Dict[str, str]:
         timestamps: Dict[str, str] = {}
@@ -3530,6 +3629,8 @@ class MAGMemory(MemoryBase):
             validator_source = "vector+bm25_validator"
             if v.get("source") == "graph_fact" or v.get("metadata", {}).get("graph_object") == "edge_fact":
                 validator_source = _mag_add_source(validator_source, "graph_fact")
+            if v.get("source") == "graph_entity" or v.get("metadata", {}).get("graph_object") == "entity_node":
+                validator_source = _mag_add_source(validator_source, "graph_entity")
             merged_map[rid] = {
                 "id": rid,
                 "memory": v.get("memory", ""),
@@ -3582,7 +3683,13 @@ class MAGMemory(MemoryBase):
                     "created_at": v.get("created_at", ""),
                     "source": _mag_add_source(
                         "vector+bm25_fallback",
-                        "graph_fact" if v.get("source") == "graph_fact" or v.get("metadata", {}).get("graph_object") == "edge_fact" else "",
+                        (
+                            "graph_fact"
+                            if v.get("source") == "graph_fact" or v.get("metadata", {}).get("graph_object") == "edge_fact"
+                            else "graph_entity"
+                            if v.get("source") == "graph_entity" or v.get("metadata", {}).get("graph_object") == "entity_node"
+                            else ""
+                        ),
                     ),
                     "entities": v.get("entities", []),
                     "metadata": dict(v.get("metadata", {})),

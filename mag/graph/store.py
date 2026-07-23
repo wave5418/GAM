@@ -194,7 +194,37 @@ class GraphStore:
                 "attention_weight_sum": node.get("attention_weight_sum", 0.0),
                 "linked_sentence_ids": list(node.get("linked_sentence_ids", [])),
                 "entity_type": node.get("entity_type", ""),
+                "summary": node.get("summary", ""),
+                "summary_facts": list(node.get("summary_facts", [])),
             }
+
+    def append_entity_summary_fact(
+        self,
+        name: str,
+        fact: str,
+        source_id: str = "",
+        max_facts: int = 20,
+    ) -> None:
+        """Maintain a lightweight Graphiti-style entity node summary from facts."""
+        node_id = name.strip().lower()
+        fact_text = fact.strip()
+        if not node_id or not fact_text:
+            return
+        with self._lock:
+            g = self.graph
+            if node_id not in g.nodes:
+                g.add_node(node_id, attention_weight_sum=0.0, linked_sentence_ids=[])
+            summary_facts = list(g.nodes[node_id].get("summary_facts", []))
+            if fact_text not in summary_facts:
+                summary_facts.append(fact_text)
+            summary_facts = summary_facts[-max_facts:]
+            g.nodes[node_id]["summary_facts"] = summary_facts
+            g.nodes[node_id]["summary"] = "\n".join(summary_facts)
+            if source_id:
+                source_ids = list(g.nodes[node_id].get("summary_source_ids", []))
+                if source_id not in source_ids:
+                    source_ids.append(source_id)
+                g.nodes[node_id]["summary_source_ids"] = source_ids[-max_facts:]
 
     def get_neighbors(
         self,

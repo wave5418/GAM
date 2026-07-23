@@ -148,3 +148,16 @@ def test_path_search_prefers_fact_memory_ids_on_edges():
 
     source_ids = {sid for path in paths for sid in path["sentences"]}
     assert source_ids == {"fact_1"}
+
+
+def test_graph_store_maintains_entity_summary_from_facts():
+    graph = GraphStore()
+
+    graph.append_entity_summary_fact("Alice", "Alice painted sunsets.", source_id="fact_1")
+    graph.append_entity_summary_fact("Alice", "Alice bought a camera.", source_id="fact_2")
+    graph.append_entity_summary_fact("Alice", "Alice painted sunsets.", source_id="fact_1")
+
+    entity = graph.get_entity("alice")
+
+    assert entity["summary"] == "Alice painted sunsets.\nAlice bought a camera."
+    assert entity["summary_facts"] == ["Alice painted sunsets.", "Alice bought a camera."]
