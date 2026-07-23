@@ -2913,9 +2913,79 @@ class MAGMemory(MemoryBase):
                 return False
         return True
 
-    def _mag_get_scoped_payload(self, sentence_id: str, filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _mag_prefetch_scoped_payloads(
+        self,
+        sentence_ids: List[str],
+        filters: Optional[Dict[str, Any]],
+        payload_cache: Dict[str, Optional[Dict[str, Any]]],
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Batch materialize sentence payloads for a single query.
+
+        Qdrant can retrieve by id efficiently, but doing hundreds of single-id
+        RPCs in Python dominates graph retrieval latency. This helper dedupes
+        ids, batch retrieves payloads, applies scope filters once, and stores
+        both hits and misses in the per-query cache.
+        """
+        ids = []
+        seen = set()
+        for sentence_id in sentence_ids:
+            sid = str(sentence_id or "").strip()
+            if not sid or sid in seen or sid in payload_cache:
+                continue
+            seen.add(sid)
+            ids.append(sid)
+        if not ids:
+            return payload_cache
+
+        retrieved = {}
         try:
-            rec = self.vector_store.get(vector_id=sentence_id)
+            if hasattr(self.vector_store, "client") and hasattr(self.vector_store.client, "retrieve"):
+                points = self.vector_store.client.retrieve(
+                    collection_name=self.collection_name,
+                    ids=ids,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in points or []:
+                    sid = str(getattr(point, "id", ""))
+                    payload = getattr(point, "payload", None)
+                    if isinstance(payload, dict) and self._mag_payload_matches_filters(payload, filters):
+                        retrieved[sid] = payload
+        except Exception:
+            retrieved = {}
+
+        if retrieved:
+            for sid in ids:
+                payload_cache[sid] = retrieved.get(sid)
+            return payload_cache
+
+        for sid in ids:
+            try:
+                rec = self.vector_store.get(vector_id=sid)
+                payload = getattr(rec, "payload", None) if rec else None
+                if isinstance(payload, dict) and self._mag_payload_matches_filters(payload, filters):
+                    payload_cache[sid] = payload
+                else:
+                    payload_cache[sid] = None
+            except Exception:
+                payload_cache[sid] = None
+        return payload_cache
+
+    def _mag_get_scoped_payload(
+        self,
+        sentence_id: str,
+        filters: Optional[Dict[str, Any]],
+        payload_cache: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        sid = str(sentence_id or "").strip()
+        if not sid:
+            return None
+        if payload_cache is not None:
+            if sid not in payload_cache:
+                self._mag_prefetch_scoped_payloads([sid], filters, payload_cache)
+            return payload_cache.get(sid)
+        try:
+            rec = self.vector_store.get(vector_id=sid)
             if not rec or not hasattr(rec, "payload"):
                 return None
             payload = rec.payload
@@ -2944,6 +3014,7 @@ class MAGMemory(MemoryBase):
         query_embedding = None
         query_entities = []
         qews: List[EntityWeight] = []
+        payload_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         search_started = time.perf_counter()
         last_timing_mark = search_started
         timing_ms: Dict[str, float] = {}
@@ -3077,10 +3148,15 @@ class MAGMemory(MemoryBase):
                 route_debug["graph_paths"] = len(bfs_paths)
                 _mark_timing("graph_search_paths")
 
+                graph_sentence_ids = []
+                for path_info in bfs_paths:
+                    graph_sentence_ids.extend(str(sid) for sid in path_info.get("sentences", []) if sid)
+                self._mag_prefetch_scoped_payloads(graph_sentence_ids, filters, payload_cache)
+
                 for path_info in bfs_paths:
                     scoped_payloads = []
                     for sid in path_info.get("sentences", []):
-                        payload = self._mag_get_scoped_payload(sid, filters)
+                        payload = self._mag_get_scoped_payload(sid, filters, payload_cache)
                         if payload is None:
                             scoped_payloads = []
                             break
@@ -3338,15 +3414,26 @@ class MAGMemory(MemoryBase):
         # they are evidence support unless they already passed graph/vector routes.
         if self.mag_use_context_window and merged_list:
             seen_ids = {r.get("id", "") for r in merged_list}
+            parent_ids = [str(r.get("id", "")) for r in merged_list if r.get("id")]
+            self._mag_prefetch_scoped_payloads(parent_ids, filters, payload_cache)
+            neighbor_ids = []
+            for pid in parent_ids:
+                p = payload_cache.get(pid)
+                if not isinstance(p, dict):
+                    continue
+                for direction in ("prev_sentence_id", "next_sentence_id"):
+                    neighbor_id = p.get(direction, "")
+                    if neighbor_id:
+                        neighbor_ids.append(str(neighbor_id))
+            self._mag_prefetch_scoped_payloads(neighbor_ids, filters, payload_cache)
             for r in merged_list:
                 pid = r.get("id", "")
                 if not pid:
                     continue
                 try:
-                    rec = self.vector_store.get(vector_id=pid)
-                    if not rec or not hasattr(rec, "payload"):
+                    p = self._mag_get_scoped_payload(pid, filters, payload_cache)
+                    if not isinstance(p, dict):
                         continue
-                    p = rec.payload
                     base_score = r.get("score", 0) * 0.95  # 邻居句轻微降权
                     for direction in ("prev_sentence_id", "next_sentence_id"):
                         neighbor_id = p.get(direction, "")
@@ -3354,7 +3441,7 @@ class MAGMemory(MemoryBase):
                             continue
                         # 邻居已在池中 → 双向提分
                         if neighbor_id in merged_map:
-                            neighbor_payload = self._mag_get_scoped_payload(neighbor_id, filters)
+                            neighbor_payload = self._mag_get_scoped_payload(neighbor_id, filters, payload_cache)
                             if neighbor_payload is not None:
                                 merged_map[neighbor_id]["score"] = max(
                                     merged_map[neighbor_id]["score"], base_score)
@@ -3367,7 +3454,7 @@ class MAGMemory(MemoryBase):
                         if neighbor_id in seen_ids:
                             continue
                         try:
-                            nb_p = self._mag_get_scoped_payload(neighbor_id, filters)
+                            nb_p = self._mag_get_scoped_payload(neighbor_id, filters, payload_cache)
                             if nb_p is not None:
                                 support = r.setdefault("supporting_context", [])
                                 support_text = nb_p.get("data", "")
