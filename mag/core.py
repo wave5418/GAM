@@ -2571,7 +2571,7 @@ class MAGMemory(MemoryBase):
     # ==================================================================
 
     def _mag_sentence_pipeline(self, messages, metadata: Dict[str, Any], filters: Dict[str, Any], default_timestamp: datetime = None) -> List[Dict[str, Any]]:
-        """S1分句→S2存原始句子→S3 LLM直抽三元组→S4 triples建图"""
+        """S1分句→S2构建并存储 evidence units→S3 LLM直抽三元组→S4 triples建图"""
         import hashlib as _hashlib
         from mem0.utils.lemmatization import lemmatize_for_bm25 as _lemmatize
 
@@ -2617,7 +2617,7 @@ class MAGMemory(MemoryBase):
             filtered_ew.append(all_ew[i])  # 对齐: 跳过 dedup/merge 后保持索引一致
             filtered_idx.append(i)  # 记录原始索引
             unit = evidence_units[i]
-            # 标准化 Schema: [ID] [Timestamp] [Entities] [RawText]
+            # 标准化 Schema: [ID] [Timestamp] [Entities] [EvidenceUnitText]
             payload = {
                 "data": text,
                 "entities": [e.to_dict() for e in all_ew[i]],
